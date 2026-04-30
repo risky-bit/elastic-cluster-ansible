@@ -1,0 +1,15 @@
+- name: Deploy Kibana cluster
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Execute commands to delete all items for Kibana
+      shell: |
+        sudo systemctl stop kibana
+        sudo systemctl disable kibana
+
+        sudo rpm -e kibana-{{ es_version }}-1.x86_64
+
+        sudo rm -rf /etc/kibana
+

@@ -1,0 +1,150 @@
+{% set node_roles_list = roles.split(',') | map('trim') | list %}
+{% set es_major = es_version.split('.')[0] | int %}
+
+# ======================== Elasticsearch Configuration =========================
+#
+# NOTE: Elasticsearch comes with reasonable defaults for most settings.
+#       Before you set out to tweak and tune the configuration, make sure you
+#       understand what are you trying to accomplish and the consequences.
+#
+# The primary way of configuring a node is via this file. This template lists
+# the most important settings you may want to configure for a production cluster.
+#
+# Please consult the documentation for further information on configuration options:
+# https://www.elastic.co/guide/en/elasticsearch/reference/index.html
+#
+# ---------------------------------- Cluster -----------------------------------
+#
+# Use a descriptive name for your cluster:
+#
+cluster.name: {{ cluster_name | default('es-cluster') }}
+#
+# ------------------------------------ Node ------------------------------------
+#
+# Use a descriptive name for the node:
+#
+node.name: {{ inventory_hostname }}
+node.attr.zone: {{ node_zone }}
+cluster.routing.allocation.awareness.attributes: zone
+#
+# Add custom attributes to the node:
+#
+#node.attr.rack: r1
+{% if (ignore_roles | default(false)) %}
+# node.roles: [ ]
+{% else %}
+node.roles: [ {% for role in node_roles_list if not (es_major >= 9 and role == 'ml') %}{{ role }}{% if not loop.last %}, {% endif %}{% endfor %} ]
+{% endif %}
+#
+# Old cluster had this parameter, Elastic does not recommend using this parameter.
+# bootstrap.system_call_filter: false 
+# ----------------------------------- Paths ------------------------------------
+#
+# Path to directory where to store the data (separate multiple locations by comma):
+#
+path.data: {{ path_data }}
+#
+# Path to log files:
+#
+path.logs: {{ path_logs }}
+#
+# ----------------------------------- Memory -----------------------------------
+#
+# Lock the memory on startup:
+#
+#bootstrap.memory_lock: true
+#
+# Make sure that the heap size is set to about half the memory available
+# on the system and that the owner of the process is allowed to use this
+# limit.
+#
+# Elasticsearch performs poorly when the system is swapping the memory.
+#
+# ---------------------------------- Network -----------------------------------
+#
+# By default Elasticsearch is only accessible on localhost. Set a different
+# address here to expose this node on the network:
+#
+network.host: "{{ bind_ip }}"
+#
+# By default Elasticsearch listens for HTTP traffic on the first free port it
+# finds starting at 9200. Set a specific HTTP port here:
+#
+http.port: {{ http_port | default(9200) }}
+transport.port: {{ transport_port | default(9300) }}
+#
+# For more information, consult the network module documentation.
+#
+# --------------------------------- Discovery ----------------------------------
+#
+# Pass an initial list of hosts to perform discovery when this node is started:
+# The default list of hosts is ["127.0.0.1", "[::1]"]
+#
+#discovery.seed_hosts: ["host1", "host2"]
+#
+# Bootstrap the cluster using an initial set of master-eligible nodes:
+#
+#cluster.initial_master_nodes: ["node-1", "node-2"]
+#
+# For more information, consult the discovery and cluster formation module documentation.
+{% if (setup_mode | default(false)) %}
+cluster.initial_master_nodes: ["{{ groups['elastic_nodes'][0] }}"]
+discovery.seed_hosts: ["{{ groups['elastic_nodes'][0] }}:{{ transport_port | default(9300) }}"]
+{% else %}
+# cluster.initial_master_nodes: [{{ initial_master_nodes }}]
+discovery.seed_hosts: [{{ seed_hosts }}]
+{% endif %}
+#
+# ---------------------------------- Various -----------------------------------
+#
+# Allow wildcard deletion of indices:
+#
+action.destructive_requires_name: true
+action.auto_create_index: +.kibana*,+kibana-int,+logstash-*,+idx_*,+pssdata*,+error*,.security,.security-6,.monitoring*,.watches,.triggered_watches,.watcher-history*,.ml*
+
+reindex.remote.whitelist: {{ reindes_remote_allowlist }}
+indices.recovery.max_bytes_per_sec: 100mb
+
+xpack.ml.enabled: false
+#xpack.monitoring.enabled: true
+xpack.watcher.enabled: true
+
+#----------------------- BEGIN SECURITY AUTO CONFIGURATION -----------------------
+#
+# The following settings, TLS certificates, and keys have been automatically      
+# generated to configure Elasticsearch security features on 28-01-2026 17:02:37
+#
+# --------------------------------------------------------------------------------
+
+# Enable security features
+xpack.security.enabled: true
+
+xpack.security.enrollment.enabled: true
+
+xpack.security.transport.ssl.enabled: true
+xpack.security.transport.ssl.verification_mode: certificate
+xpack.security.transport.ssl.client_authentication: none
+xpack.security.transport.ssl.keystore.path: certificates/certfile.p12
+#xpack.security.transport.ssl.key: certificates/new-es.key
+#xpack.security.transport.ssl.certificate: certificates/new-es.crt
+#xpack.security.transport.ssl.certificate_authorities: [ "certificates/new-ca.crt" ]
+
+xpack.security.http.ssl.enabled: true
+xpack.security.http.ssl.client_authentication: none
+xpack.security.http.ssl.keystore.path: certificates/certfile.p12
+#xpack.security.http.ssl.key: certificates/new-es.key
+#xpack.security.http.ssl.certificate: certificates/new-es.crt
+#xpack.security.http.ssl.certificate_authorities: [ "certificates/new-ca.crt" ]
+
+xpack.monitoring.collection.enabled: true
+
+# Allow HTTP API connections from anywhere
+# Connections are encrypted and require user authentication
+http.host: 0.0.0.0
+
+# Allow other nodes to join the cluster from anywhere
+# Connections are encrypted and mutually authenticated
+transport.host: 0.0.0.0
+
+#----------------------- END SECURITY AUTO CONFIGURATION -------------------------
+

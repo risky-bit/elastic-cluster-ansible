@@ -1,0 +1,105 @@
+- name: Deploy Elasticsearch cluster
+  hosts: kibana_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+    # ---------------------------------------------------------------------
+    # 0. Set variables, prepare enviornment
+    # ---------------------------------------------------------------------
+    - name: Compute es_major and package name
+      set_fact:
+        es_major: "{{ (es_version.split('.')[0] | int) if (es_version is defined) else 8 }}"
+        es_package_name: >-
+          {{ (es_package_rpm_template | default('elasticsearch-{{ es_version }}.rpm')) | replace('{{ es_version }}', es_version|string) }}
+
+    - name: Debug resolved values (version / package)
+      debug:
+        msg:
+          - "Host {{ inventory_hostname }} -> es_version={{ es_version }}, es_major={{ es_major }}, es_package_name={{ es_package_name }}"
+
+    - name: Call API without SSL verification
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        method: GET
+        user: "{{ elasticsearch_username }}"
+        password: "{{ elasticsearch_password }}"
+        force_basic_auth: true
+        validate_certs: false
+    #    status_code: 200
+      register: api_result
+      failed_when: api_result.status != 200
+      loop: "{{ elasticsearch_hosts }}"
+
+    - name: Share elasticsearch binary
+      copy:
+        src: "{{ kb_rpm_local_path }}"
+        dest: "{{ kb_rpm_host_path }}"
+        mode: '0644'
+
+    # ---------------------------------------------------------------------
+    # 2. Install Kibana from local RPM if missing
+    # ---------------------------------------------------------------------
+    - name: Check if Kibana is already installed
+      command: rpm -q kibana
+      register: kb_installed
+      failed_when: false
+      changed_when: false
+
+    - name: Install Kibana via rpm
+      command: "rpm -Uvh {{ kb_rpm_host_path }}"
+      register: rpm_install
+      when: kb_installed.rc != 0
+
+    - name: Debug installation output
+      debug:
+        var: rpm_install.stdout_lines
+      when: kb_installed.rc != 0
+
+    # ---------------------------------------------------------------------
+    # 4. Render kibana.yml configuration
+    # ---------------------------------------------------------------------
+    - name: Render kibana.yml from template for all nodes (to form a cluster)
+      template:
+        src: kibana.yml.j2
+        dest: /etc/kibana/kibana.yml
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Copy kibana certificates to all nodes
+      copy:
+        src: "{{ kibana_certificates_path }}/"
+        dest: "/etc/kibana/certificates"
+        mode: '0644'
+
+    - name: Set passwords for kibana
+      shell: |
+        echo "yes" | sudo kibana-keystore create
+        echo "{{ elasticsearch_password }}" | /usr/share/kibana/bin/kibana-keystore add elasticsearch.password --stdin
+        echo "{{ encryptionKey }}" | /usr/share/kibana/bin/kibana-keystore add xpack.encryptedSavedObjects.encryptionKey --stdin
+        echo "{{ encryptionKey }}" | /usr/share/kibana/bin/kibana-keystore add xpack.security.encryptionKey --stdin
+        echo "{{ encryptionKey }}" | /usr/share/kibana/bin/kibana-keystore add xpack.reporting.encryptionKey --stdin
+
+    # ---------------------------------------------------------------------
+    # 4. Enable and start service after package installation
+    # ---------------------------------------------------------------------
+    - name: Enable and start Kibana service after installation
+      systemd:
+        name: kibana
+        enabled: yes
+        daemon_reload: yes
+        state: started
+
+    - name: Wait for Elasticsearch HTTP on bootstrap node
+      uri:
+        url: "https://{{ bind_ip }}:{{ kibana_port }}"
+        method: GET
+        validate_certs: no
+        status_code: [200,401,403]
+      register: kibana_boot
+      retries: 20
+      delay: 5
+      until: kibana_boot is succeeded
+      
+

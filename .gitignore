@@ -1,0 +1,79 @@
+# ─── Sensitive inventory and secrets ──────────────────────────────────────
+ansible/inventory/prod.ini
+ansible/inventory/staging.ini
+ansible/inventory/*.real.ini
+**/vault.yml
+**/host_vars/**/vault.yml
+**/group_vars/**/vault.yml
+**/secrets.yml
+**/secret*.yml
+.vault_pass
+*.vault_pass
+
+# ─── Certificates and keys ────────────────────────────────────────────────
+**/*.key
+**/*.crt
+**/*.pem
+**/*.p12
+**/*.pfx
+**/*.jks
+**/*.keystore
+**/*.truststore
+
+# ─── Binaries ─────────────────────────────────────────────────────────────
+binaries/*.rpm
+binaries/*.deb
+binaries/*.tar.gz
+binaries/*.tgz
+binaries/*.zip
+binaries/*.rpm.asc
+vendor/**/bin/
+
+# ─── Ansible runtime artifacts ────────────────────────────────────────────
+*.retry
+.ansible/
+ansible/.cache/
+ansible.log
+*.log
+
+# ─── Consultant recordings ────────────────────────────────────────────────
+GMT*
+**/GMT*
+**/*.mp4
+**/*.m4a
+**/*.vtt
+
+# ─── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# ─── Node ─────────────────────────────────────────────────────────────────
+node_modules/
+
+# ─── macOS ────────────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# ─── IDE / Editor ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+
+# ─── Claude Code internal state ───────────────────────────────────────────
+.claude/
+
+# ─── Environment files ────────────────────────────────────────────────────
+.env
+.envrc

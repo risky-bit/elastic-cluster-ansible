@@ -1,0 +1,202 @@
+- name: Prepare elastic hosts
+  hosts: elastic_nodes
+  become: true
+  gather_facts: false
+
+  vars:
+    threshold: "{{ disk_size_threshold_large if 'data' in roles else disk_size_threshold_small }}"
+
+  tasks:
+    # ---------------------------------------------------------------------
+    # 1. Configure hosts
+    # ---------------------------------------------------------------------
+    - name: Ensure vm.swappiness is set to 1
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        line: "vm.swappiness=1"
+        state: present
+        create: yes
+        backup: yes
+
+    - name: Ensure vm.max_map_count=1048576 is set in file /etc/sysctl.conf
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        line: "vm.max_map_count=1048576"
+        state: present
+        create: yes
+        backup: yes
+
+    - name: Ensure net.ipv4.tcp_retries2=5 is set in file /etc/sysctl.conf
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        line: "net.ipv4.tcp_retries2=5"
+        state: present
+        create: yes
+        backup: yes
+
+    - name: Ensure elasticsearch has nofile limit in limits.conf
+      ansible.builtin.lineinfile:
+        path: /etc/security/limits.conf
+        line: "elasticsearch  -  nofile  65535"
+        state: present
+        create: yes
+        backup: yes
+
+    - name: Apply all changes
+      shell: |
+        sudo sysctl -p
+        echo "applied"
+
+    # ---------------------------------------------------------------------
+    # 2. Prepare disks, fstab, access and ownership
+    # ---------------------------------------------------------------------
+    - name: Print variable
+      when: 
+        - configure_disks | default(true)
+      debug:
+        var: threshold
+
+    - name: Prepare all disks
+      when: 
+        - configure_disks | default(true)
+      shell: |
+        VGNAME="elkvg"
+        LVNAME="elklv"
+        TARGET_FOLDER="{{ mount_point }}"
+        # THRESHOLD={{ threshold }}
+
+
+        for disk in $(lsblk -b -dn -o NAME,SIZE | awk '$2 >= {{ threshold }} {print $1}'); do
+          echo "Processing /dev/$disk"
+          MOUNTED_PATHS=$(lsblk -no MOUNTPOINT "/dev/$disk" | grep -v "^$")
+          if [ -n "$MOUNTED_PATHS" ]; then
+            echo "Disk /dev/$disk is already mounted. To avoid dangerous actions we will not touch any disks..."
+            exit 0
+          fi
+        done
+
+        for disk in $(lsblk -b -dn -o NAME,SIZE | awk '$2 >= {{ threshold }} {print $1}'); do
+          echo "Processing /dev/$disk"
+          if [ -z "$(sudo pvs | grep "/dev/$disk")" ]; then
+            echo "/dev/$disk is not a physical volume yet, running pvcreate..."
+            sudo pvcreate /dev/$disk
+            if [ $? -ne 0 ]; then
+              echo "pvcreate command failed, exiting"
+              exit 1
+            fi
+
+            if sudo vgs --noheadings -o vg_name | grep -qw "$VGNAME"; then
+              echo "Volume group $VGNAME exists"
+              vgextend /dev/$VGNAME /dev/$disk
+              if [ $? -ne 0 ]; then
+                echo "vgextend command failed, exiting"
+                exit 1
+              fi
+            else
+              echo "Volume group $VGNAME does not exist"
+              sudo vgcreate $VGNAME /dev/$disk
+              if [ $? -ne 0 ]; then
+                echo "vgcreate command failed, exiting"
+                exit 1
+              fi
+            fi
+
+            if sudo lvs --noheadings -o lv_name | grep -qw "$LVNAME"; then
+              echo "Logical volume $LVNAME exists"
+              sudo lvm lvextend -l +100%FREE /dev/$VGNAME/$LVNAME
+              if [ $? -ne 0 ]; then
+                echo "lvextend command failed, exiting"
+                exit 1
+              fi
+            else
+              echo "Logical volume $LVNAME does not exist"
+              sudo lvcreate -l 100%FREE -n $LVNAME $VGNAME --yes
+              if [ $? -ne 0 ]; then
+                echo "lvcreate command failed, exiting"
+                exit 1
+              fi
+            fi
+
+            sudo lvmdiskscan -l
+            if [ $? -ne 0 ]; then
+              echo "lvmdiskscan command failed, exiting"
+              exit 1
+            fi
+            if ! sudo blkid /dev/$VGNAME/$LVNAME | grep -q 'TYPE="xfs"'; then
+              echo "Formatting /dev/$VGNAME/$LVNAME as XFS..."
+              sudo mkfs.xfs /dev/$VGNAME/$LVNAME
+              if [ $? -ne 0 ]; then
+                echo "mkfs.xfs command failed, exiting"
+                exit 1
+              fi
+            else
+              echo "/dev/$VGNAME/$LVNAME already has XFS filesystem, skipping..."
+            fi
+          else
+            echo "/dev/$disk is already a physical volume, skipping..."
+          fi
+        done
+
+        mkdir -p $TARGET_FOLDER
+
+        blkid -s UUID -o value /dev/mapper/elkvg-elklv
+        # Add a 5-second delay before running the UUID command
+        sleep 5
+
+        UUID=$(blkid -s UUID -o value /dev/mapper/elkvg-elklv)
+        echo "$UUID"
+        if [[ $UUID =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+          echo "Valid UUID: $UUID"
+        else
+          echo "Invalid UUID: $UUID"
+          exit -1
+        fi
+
+        if ! grep -q "$TARGET_FOLDER" /etc/fstab; then
+          LINE="UUID=$UUID  $TARGET_FOLDER  xfs defaults,nofail,x-systemd.automount,x-systemd.device-timeout=10  0 2"
+          echo -e "$LINE" | sudo tee -a /etc/fstab > /dev/null
+          echo "Line added to /etc/fstab"
+        else
+          echo "$TARGET_FOLDER already exists in /etc/fstab, skipping"
+        fi
+
+        mount -a
+        if [ $? -ne 0 ]; then
+          echo "mount command failed, exiting"
+          exit 1
+        fi
+
+        xfs_growfs /dev/mapper/$VGNAME-$LVNAME
+        if [ $? -ne 0 ]; then
+          echo "xfs_growfs command failed, exiting"
+          exit 1
+        fi
+
+    # ---------------------------------------------------------------------
+    # 3. Configire Configure firewalls
+    # ---------------------------------------------------------------------
+    - name: Start Firewalld service
+      systemd:
+        name: firewalld
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Open TCP port in firewalld (HTTP Elastic port)
+      command: firewall-cmd --zone={{ firewall_zone }} --add-port={{ http_port }}/tcp --permanent
+      become: true
+      when: inventory_hostname in groups['elastic_nodes']
+
+    - name: Open TCP port in firewalld (Transport Elastic port)
+      command: firewall-cmd --zone={{ firewall_zone }} --add-port={{ transport_port }}/tcp --permanent
+      become: true
+      when: inventory_hostname in groups['elastic_nodes']
+
+    - name: Open TCP port in firewalld (Kibana port)
+      command: firewall-cmd --zone={{ firewall_zone }} --add-port={{ kibana_port }}/tcp --permanent
+      become: true
+      when: inventory_hostname in groups['kibana_nodes']
+
+    - name: Reload firewalld
+      command: firewall-cmd --reload
+      become: true

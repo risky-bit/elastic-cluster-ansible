@@ -1,0 +1,18 @@
+- name: Uninstall Elasticsearch cluster
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Execute commands to delete all items for Elasticsearch
+      shell: |
+        sudo systemctl stop elasticsearch
+        sudo systemctl disable elasticsearch
+
+        sudo rpm -e elasticsearch-{{ es_version }}-1.x86_64
+
+        sudo rm -rf /etc/elasticsearch
+        sudo rm -rf {{ path_data }}
+        sudo rm -rf {{ path_logs }}
+
+

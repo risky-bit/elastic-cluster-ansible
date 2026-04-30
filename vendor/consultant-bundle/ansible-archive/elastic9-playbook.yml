@@ -1,0 +1,393 @@
+- name: Deploy Elasticsearch cluster
+  hosts: elastic_nodes
+  become: true
+  gather_facts: false
+
+  vars:
+    expected_nodes: "{{ groups['elastic_nodes'] | map('extract', hostvars, 'inventory_hostname') | list }}"
+
+  tasks:
+    # ---------------------------------------------------------------------
+    # 0. Set variables, prepare enviornment
+    # ---------------------------------------------------------------------
+    - name: Compute es_major and package name
+      set_fact:
+        es_major: "{{ (es_version.split('.')[0] | int) if (es_version is defined) else 8 }}"
+        es_package_name: >-
+          {{ (es_package_rpm_template | default('elasticsearch-{{ es_version }}.rpm')) | replace('{{ es_version }}', es_version|string) }}
+
+    - name: Debug resolved values (version / package)
+      debug:
+        msg:
+          - "Host {{ inventory_hostname }} -> es_version={{ es_version }}, es_major={{ es_major }}, es_package_name={{ es_package_name }}"
+
+    - name: Share elasticsearch binary
+      copy:
+        src: "{{ es_rpm_local_path }}"
+        dest: "{{ es_rpm_host_path }}"
+        mode: '0644'
+
+    # ---------------------------------------------------------------------
+    # 1. Determine bootstrap (first master) node dynamically
+    # ---------------------------------------------------------------------
+    - name: Determine first master node
+      set_fact:
+        es_first_master: "{{ (groups['elasticsearch'] | default([]))[0] }}"
+      when: es_first_master is not defined
+
+    - name: Debug detected first master node and bootstrap flag
+      debug:
+        msg: |
+          es_first_master = {{ es_first_master }}
+          es_bootstrap = {{ es_bootstrap | default(false) }}
+
+    # ---------------------------------------------------------------------
+    # 2. Install Elasticsearch from local RPM if missing
+    # ---------------------------------------------------------------------
+    - name: Check if Elasticsearch is already installed
+      command: rpm -q elasticsearch
+      register: es_installed
+      failed_when: false
+      changed_when: false
+
+    - name: Stop playbook if Elasticsearch is installed on any node
+      fail:
+        msg: "Elasticsearch is already installed on at least one node. Aborting playbook."
+      when: es_installed.rc == 0
+      delegate_to: "{{ inventory_hostname }}"
+
+    - name: Install Elasticsearch via rpm
+      command: "rpm -Uvh {{ es_rpm_host_path }}"
+      register: rpm_install
+      when: es_installed.rc != 0
+
+    - name: Debug installation output
+      debug:
+        var: rpm_install.stdout_lines
+      when: es_installed.rc != 0
+
+    # ---------------------------------------------------------------------
+    # 3. Ensure elasticsearch user exists (for permissions and service)
+    # ---------------------------------------------------------------------
+    - name: Ensure elasticsearch user exists
+      user:
+        name: elasticsearch
+        system: yes
+        shell: /sbin/nologin
+      become: true
+
+    - name: Build list of node roles from host var
+      set_fact:
+        node_roles_list: "{{ (roles | default('data')).split(',') | map('trim') | list }}"
+
+    # ---------------------------------------------------------------------
+    # 4. Render elasticsearch.yml configuration
+    # ---------------------------------------------------------------------
+    - name: Render elasticsearch.yml from template for all nodes (to form a cluster)
+      template:
+        src: elasticsearch.yml.j2
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: root
+        mode: '0644'
+      vars:
+        setup_mode: true
+        ignore_roles: true
+        discovery_seed_hosts_list: "{{ (setup_discovery_seed_hosts | default('')) | split(',') | map('trim') | list }}"
+        initial_master_nodes: "{{ (setup_groups['elasticsearch'] | default([]))[:3] }}"
+      when: 
+        - es_major | int >= 6
+        - es_bootstrap | default(false)
+        - inventory_hostname == es_first_master
+
+    - name: Render elasticsearch.yml from template for all nodes (to form a cluster) with roles
+      template:
+        src: elasticsearch.yml.j2
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: root
+        mode: '0644'
+      vars:
+        setup_mode: true
+        ignore_roles: false
+        discovery_seed_hosts_list: "{{ (setup_discovery_seed_hosts | default('')) | split(',') | map('trim') | list }}"
+        initial_master_nodes: "{{ (setup_groups['elasticsearch'] | default([]))[:3] }}"
+      when: 
+        - es_major | int >= 6
+        - es_bootstrap | default(false)
+        - not (inventory_hostname == es_first_master)
+
+    - name: Render elasticsearch.yml from template for all nodes (to form a cluster)
+      template:
+        src: elasticsearch.yml.j2
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: root
+        mode: '0644'
+      vars:
+        setup_mode: true
+        ignore_roles: true
+        discovery_seed_hosts_list: "{{ (setup_discovery_seed_hosts | default('')) | split(',') | map('trim') | list }}"
+        initial_master_nodes: "{{ (setup_groups['elasticsearch'] | default([]))[:3] }}"
+      when: 
+        - es_major | int >= 6
+        - es_bootstrap | default(false)
+        - inventory_hostname == es_first_master
+
+    - name: Copy elasticsearch certificates to all nodes
+      copy:
+        src: "{{ elastic_certificates_path }}/"
+        dest: "/etc/elasticsearch/certificates"
+        mode: '0644'
+
+    - name: Set passwords for certificates
+      shell: |
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.transport.ssl.keystore.secure_password
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.transport.ssl.truststore.secure_password
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.http.ssl.keystore.secure_password
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.http.ssl.truststore.secure_password
+        echo "{{ http_keystore_password }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add xpack.security.http.ssl.keystore.secure_password --stdin
+        echo "{{ transport_keystore_password }}" | /usr/share/elasticsearch/bin/elasticsearch-keystore add xpack.security.transport.ssl.keystore.secure_password --stdin
+
+    - name: Ensure data folder exists and is owned by elasticsearch
+      ansible.builtin.file:
+        path: "{{ path_data }}"
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '2750'
+
+    - name: Ensure logs folder exists and is owned by elasticsearch
+      ansible.builtin.file:
+        path: "{{ path_logs }}"
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '2750'
+
+    # ---------------------------------------------------------------------
+    # 4. Enable and start service after package installation
+    # ---------------------------------------------------------------------
+    - name: Enable and start Elasticsearch service after installation
+      systemd:
+        name: elasticsearch
+        enabled: yes
+        daemon_reload: yes
+        state: started
+      when: 
+        - es_installed.rc != 0
+        - es_major | int >= 8
+        - es_bootstrap | default(false)
+        - inventory_hostname == es_first_master
+
+    # # ---------------------------------------------------------------------
+    # # 5. Bootstrap cluster on first node (per Evermight)
+    # # ---------------------------------------------------------------------
+    # - name: Start Elasticsearch service on bootstrap node (generate certs)
+    #   systemd:
+    #     name: elasticsearch
+    #     enabled: yes
+    #     state: restarted
+    #     daemon_reload: yes
+    #   when:
+    #     - es_major | int >= 8
+    #     - es_bootstrap | default(false)
+    #     - inventory_hostname == es_first_master
+
+    - name: Wait for 10 seconds
+      pause:
+        seconds: 10
+      when:
+        - es_major | int >= 8
+        - es_bootstrap | default(false)
+        - inventory_hostname == es_first_master
+
+    - name: Wait for Elasticsearch HTTP on bootstrap node
+      uri:
+        url: "https://{{ bind_ip }}:{{ http_port }}"
+        method: GET
+        validate_certs: no
+        status_code: [200,401,403]
+      register: es_boot
+      retries: 20
+      delay: 15
+      until: es_boot is succeeded
+      when:
+        - es_major | int >= 8
+        - es_bootstrap | default(false)
+        - inventory_hostname == es_first_master
+
+
+    # ---------------------------------------------------------------------
+    # 6. Save passwords
+    # ---------------------------------------------------------------------
+    - name: Generate built-in user password for elastic (bootstrap)
+      command: /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -b --url https://{{ inventory_hostname }}:{{ http_port }} -E xpack.security.http.ssl.verification_mode=none
+      register: elastic_pwd_output
+      when:
+        - inventory_hostname == es_first_master
+        - es_major | int >= 8
+      changed_when: true
+      
+
+    - name: Extract elastic password (bootstrap)
+      set_fact:
+        elastic_password: "{{ (elastic_pwd_output.stdout | regex_search('New value:\\s*(\\S+)', '\\1'))[0] }}"
+      when:
+        - inventory_hostname == es_first_master
+
+    - name: Generate built-in user password for kibana_system (bootstrap)
+      command: /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana_system -b --url https://{{ inventory_hostname }}:{{ http_port }} -E xpack.security.http.ssl.verification_mode=none
+      register: kibana_system_pwd_output
+      when:
+        - inventory_hostname == es_first_master
+        - es_major | int >= 8
+      changed_when: true
+      
+
+    - name: Extract kibana_system password (bootstrap)
+      set_fact:
+        kibana_system_password: "{{ (kibana_system_pwd_output.stdout | regex_search('New value:\\s*(\\S+)', '\\1'))[0] }}"
+      when:
+        - inventory_hostname == es_first_master
+
+    - name: Call API on first node
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:9200/"
+        method: GET
+        user: "elastic"
+        password: "{{ hostvars[es_first_master].elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: api_result
+      failed_when: api_result.status != 200
+      when:
+        - inventory_hostname == es_first_master
+
+    - name: Ensure tmp directory exists on controller
+      delegate_to: localhost
+      become: false
+      file:
+        path: "{{ playbook_dir }}/tmp"
+        state: directory
+        mode: '0700'
+      
+    - name: Save ES passwords locally on controller
+      delegate_to: localhost
+      become: false
+      copy:
+        dest: "/tmp/es_reserved_user_password-{{ cluster_name }}.txt"
+        mode: '0600'
+        content: |
+          elastic: {{ elastic_password }}
+          kibana_system: {{ kibana_system_password }}
+      run_once: true
+      when:
+        - inventory_hostname == es_first_master
+
+
+    # ---------------------------------------------------------------------
+    # 7. Start other nodes
+    # ---------------------------------------------------------------------
+    - name: Enable and start Elasticsearch service on non-bootstrap nodes
+      systemd:
+        name: elasticsearch
+        enabled: yes
+        daemon_reload: yes
+        state: started
+      when:
+        - es_major | int >= 8
+        - not (inventory_hostname == es_first_master)
+
+    - name: Query Elasticsearch node list
+      uri:
+        url: "https://{{ inventory_hostname }}:9200/_cat/nodes?h=name&format=json"
+        method: GET
+        user: "elastic"
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: es_nodes
+
+    - name: Extract node names from response
+      set_fact:
+        elastic_nodes_from_cluster: "{{ es_nodes.json | map(attribute='name') | list }}"
+
+    - name: Verify cluster nodes match inventory
+      assert:
+        that:
+          - elastic_nodes_from_cluster | sort == expected_nodes | sort
+        fail_msg: >
+          Elasticsearch nodes do not match inventory.
+          Cluster nodes: {{ elastic_nodes_from_cluster }}
+          Inventory nodes: {{ expected_nodes }}
+        success_msg: >
+          Elasticsearch cluster nodes match the inventory.
+
+    # ---------------------------------------------------------------------
+    # 8. Render production config and restart
+    # ---------------------------------------------------------------------
+    - name: Render elasticsearch.yml from template
+      template:
+        src: elasticsearch.yml.j2
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: root
+        mode: '0644'
+      vars:        
+        ignore_roles: false
+        setup_mode: false
+    
+    - name: Restart Elasticsearch service all nodes
+      systemd:
+        name: elasticsearch
+        enabled: yes
+        daemon_reload: yes
+        state: restarted
+
+    # ---------------------------------------------------------------------
+    # 9. Verify Elasticsearch API connectivity
+    # ---------------------------------------------------------------------
+    - name: Wait for Elasticsearch node API to respond
+      uri:
+        url: "https://{{ bind_ip }}:9200"
+        method: GET
+        validate_certs: no
+        status_code: [200,401,403]
+      register: es_node_check
+      retries: 20
+      delay: 5
+      until: es_node_check is succeeded
+      when:
+        - es_major | int >= 8
+        - not (inventory_hostname == es_first_master)
+    - name: Confirm node joined successfully
+      debug:
+        msg: "✅ Elasticsearch node {{ inventory_hostname }} successfully joined the cluster."
+
+    - name: Query Elasticsearch node list
+      uri:
+        url: "https://{{ inventory_hostname }}:9200/_cat/nodes?h=name&format=json"
+        method: GET
+        user: "elastic"
+        password: "{{ hostvars[es_first_master].elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: es_nodes
+
+    - name: Extract node names from response
+      set_fact:
+        elastic_nodes_from_cluster: "{{ es_nodes.json | map(attribute='name') | list }}"
+
+    - name: Verify cluster nodes match inventory
+      assert:
+        that:
+          - elastic_nodes_from_cluster | sort == expected_nodes | sort
+        fail_msg: >
+          Elasticsearch nodes do not match inventory.
+          Cluster nodes: {{ elastic_nodes_from_cluster }}
+          Inventory nodes: {{ expected_nodes }}
+        success_msg: >
+          Elasticsearch cluster nodes match the inventory.

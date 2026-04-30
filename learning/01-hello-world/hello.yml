@@ -1,0 +1,12 @@
+---
+- name: Hello World
+  hosts: local
+  gather_facts: false
+
+  tasks:
+    - name: Ping the host
+      ansible.builtin.ping:
+
+    - name: Print a message
+      ansible.builtin.debug:
+        msg: "Hello from Ansible. Running on: {{ inventory_hostname }}"

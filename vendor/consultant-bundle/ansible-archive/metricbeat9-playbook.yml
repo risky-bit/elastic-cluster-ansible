@@ -1,0 +1,128 @@
+- name: Deploy Elasticsearch cluster
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    # ---------------------------------------------------------------------
+    # 0. Set variables, prepare enviornment
+    # ---------------------------------------------------------------------
+    - name: Compute es_major and package name
+      set_fact:
+        es_major: "{{ (es_version.split('.')[0] | int) if (es_version is defined) else 8 }}"
+        es_package_name: >-
+          {{ (es_package_rpm_template | default('elasticsearch-{{ es_version }}.rpm')) | replace('{{ es_version }}', es_version|string) }}
+
+    - name: Debug resolved values (version / package)
+      debug:
+        msg:
+          - "Host {{ inventory_hostname }} -> es_version={{ es_version }}, es_major={{ es_major }}, es_package_name={{ es_package_name }}"
+
+    - name: Call API without SSL verification
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        method: GET
+        user: "{{ metricbeat_username }}"
+        password: "{{ metricbeat_password }}"
+        force_basic_auth: true
+        validate_certs: false
+    #    status_code: 200
+      register: api_result
+      failed_when: api_result.status != 200
+      loop: "{{ elasticsearch_hosts }}"
+
+    - name: Share metricbeat binary
+      copy:
+        src: "{{ metricbeat_rpm_local_path }}"
+        dest: "{{ metricbeat_rpm_host_path }}"
+        mode: '0644'
+
+    # ---------------------------------------------------------------------
+    # 2. Install Metricbeat from local RPM if missing
+    # ---------------------------------------------------------------------
+    - name: Check if Metricbeat is already installed
+      command: rpm -q metricbeat
+      register: metricbeat_installed
+      failed_when: false
+      changed_when: false
+
+    - name: Install Metricbeat via rpm
+      command: "rpm -Uvh {{ metricbeat_rpm_host_path }}"
+      register: rpm_install
+      when: metricbeat_installed.rc != 0
+
+    - name: Debug installation output
+      debug:
+        var: rpm_install.stdout_lines
+      when: metricbeat_installed.rc != 0
+
+    # ---------------------------------------------------------------------
+    # 3. Render metricbeat.yml configuration
+    # ---------------------------------------------------------------------
+    - name: Render kibana.yml from template for all nodes (to form a cluster)
+      template:
+        src: metricbeat.yml.j2
+        dest: /etc/metricbeat/metricbeat.yml
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Copy Metricbeat certificates to all nodes
+      copy:
+        src: "{{ metricbeat_certificates_path }}/"
+        dest: "/etc/metricbeat/certificates"
+        mode: '0644'
+
+    - name: Set Metricbeat secrets for all nodes
+      shell: |
+        echo "yes" | metricbeat keystore create
+        echo "{{ metricbeat_username }}" | sudo metricbeat keystore add ES_USERNAME --stdin
+        echo "{{ metricbeat_password }}" | sudo metricbeat keystore add ES_PASSWORD --stdin
+        echo "{{ metricbeat_dst_username }}" | sudo metricbeat keystore add ES_DST_USERNAME --stdin
+        echo "{{ metricbeat_dst_password }}" | sudo metricbeat keystore add ES_DST_PASSWORD --stdin
+
+    # ---------------------------------------------------------------------
+    # 4. Enable and enable module for elasticsearch-xpack
+    # ---------------------------------------------------------------------
+    - name: Enable module elasticsearch-xpack
+      shell: |
+        metricbeat modules enable elasticsearch-xpack
+      when: inventory_hostname in groups['elastic_nodes']
+
+    - name: Render elasticsearch-xpack.yml
+      template:
+        src: metricbeat-elasticsearch-xpack.yml.j2
+        dest: /etc/metricbeat/modules.d/elasticsearch-xpack.yml
+        owner: root
+        group: root
+        mode: '0644'
+      when: inventory_hostname in groups['elastic_nodes']
+
+    # ---------------------------------------------------------------------
+    # 5. Enable and enable module for kibana-xpack
+    # ---------------------------------------------------------------------
+    - name: Enable module kibana-xpack
+      shell: |
+        metricbeat modules enable kibana-xpack
+      when: inventory_hostname in groups['kibana_nodes']
+
+    - name: Render kibana-xpack.yml
+      template:
+        src: metricbeat-kibana-xpack.yml.j2
+        dest: /etc/metricbeat/modules.d/kibana-xpack.yml
+        owner: root
+        group: root
+        mode: '0644'
+      when: inventory_hostname in groups['kibana_nodes']
+
+    # ---------------------------------------------------------------------
+    # 6. Start metricbeat
+    # ---------------------------------------------------------------------
+    - name: Enable and start Metricbeat service after installation
+      systemd:
+        name: metricbeat
+        enabled: yes
+        daemon_reload: yes
+        state: started
+      
+
