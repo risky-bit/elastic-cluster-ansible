@@ -24,6 +24,7 @@ ansible/inventory/*.real.ini
 binaries/*.rpm
 binaries/*.deb
 binaries/*.tar.gz
+*.tar
 binaries/*.tgz
 binaries/*.zip
 binaries/*.rpm.asc
