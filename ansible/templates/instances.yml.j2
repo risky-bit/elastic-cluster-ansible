@@ -1,0 +1,9 @@
+instances:
+{% set all_es_hosts = groups['elastic_master_nodes'] + groups['elastic_data_nodes'] + groups['monitoring_nodes'] + groups['kibana_logstash_nodes'] %}
+{% for host in all_es_hosts %}
+  - name: "{{ host }}"
+    dns:
+      - "{{ host }}"
+    ip:
+      - "{{ hostvars[host]['ansible_host'] }}"
+{% endfor %}

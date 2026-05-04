@@ -1,0 +1,87 @@
+---
+- name: Generate TLS certificates for the Elasticsearch cluster
+  hosts: es_bootstrap_node
+  become: true
+  gather_facts: false
+
+  vars:
+    cert_tmp_dir: /tmp/elastic-certs
+    ca_file: "{{ cert_tmp_dir }}/elastic-stack-ca.p12"
+    certs_zip: "{{ cert_tmp_dir }}/elastic-certificates.zip"
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    # ----------------------------------------------------------
+    # Install Elasticsearch to get certutil
+    # ----------------------------------------------------------
+    - name: Copy Elasticsearch RPM to node
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/binaries/elasticsearch-{{ es_version }}-x86_64.rpm
+        dest: /tmp/elasticsearch-{{ es_version }}-x86_64.rpm
+        mode: '0644'
+
+    - name: Install Elasticsearch RPM
+      ansible.builtin.command: rpm -Uvh /tmp/elasticsearch-{{ es_version }}-x86_64.rpm
+      args:
+        creates: /usr/share/elasticsearch/bin/elasticsearch-certutil
+
+    # ----------------------------------------------------------
+    # Cert generation
+    # ----------------------------------------------------------
+    - name: Create cert working directory
+      ansible.builtin.file:
+        path: "{{ cert_tmp_dir }}"
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '0700'
+
+    - name: Generate CA
+      become_user: elasticsearch
+      ansible.builtin.command: >
+        /usr/share/elasticsearch/bin/elasticsearch-certutil ca
+        --silent
+        --out {{ ca_file }}
+        --pass ""
+      args:
+        creates: "{{ ca_file }}"
+
+    - name: Write instances.yml for certutil
+      ansible.builtin.template:
+        src: /workspace/elastic-ansible/ansible/templates/instances.yml.j2
+        dest: "{{ cert_tmp_dir }}/instances.yml"
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '0600'
+
+    - name: Generate certificates for all cluster nodes
+      become_user: elasticsearch
+      ansible.builtin.command: >
+        /usr/share/elasticsearch/bin/elasticsearch-certutil cert
+        --silent
+        --ca {{ ca_file }}
+        --ca-pass ""
+        --in {{ cert_tmp_dir }}/instances.yml
+        --out {{ certs_zip }}
+        --pass ""
+      args:
+        creates: "{{ certs_zip }}"
+
+    # ----------------------------------------------------------
+    # Fetch certs back to automation host
+    # ----------------------------------------------------------
+    - name: Fetch CA to automation host
+      ansible.builtin.fetch:
+        src: "{{ ca_file }}"
+        dest: /workspace/elastic-ansible/certs/
+        flat: true
+
+    - name: Fetch certificate bundle to automation host
+      ansible.builtin.fetch:
+        src: "{{ certs_zip }}"
+        dest: /workspace/elastic-ansible/certs/
+        flat: true

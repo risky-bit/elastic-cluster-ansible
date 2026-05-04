@@ -1,0 +1,159 @@
+---
+# ============================================================
+# Play 1: Common prep — all cluster nodes
+# ============================================================
+- name: Common host preparation
+  hosts: elastic_master_nodes:elastic_data_nodes:monitoring_nodes:kibana_logstash_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    # ----------------------------------------------------------
+    # Kernel tuning
+    # ----------------------------------------------------------
+    - name: Set vm.swappiness=1
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        line: "vm.swappiness=1"
+        state: present
+        create: true
+        backup: true
+
+    - name: Apply sysctl changes
+      ansible.builtin.command: sysctl -p
+      changed_when: false
+
+    # ----------------------------------------------------------
+    # Open file descriptor limit
+    # ----------------------------------------------------------
+    - name: Set nofile limit for elasticsearch user
+      ansible.builtin.lineinfile:
+        path: /etc/security/limits.conf
+        line: "elasticsearch  -  nofile  65535"
+        state: present
+        create: true
+        backup: true
+
+    # ----------------------------------------------------------
+    # Disk setup: /dev/sdb -> LVM -> XFS -> /data0
+    # ----------------------------------------------------------
+    - name: Check if volume group elkvg already exists
+      ansible.builtin.command: vgs elkvg
+      register: vg_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create LVM physical volume on /dev/sdb
+      ansible.builtin.command: pvcreate /dev/sdb
+      when: vg_check.rc != 0
+
+    - name: Create volume group elkvg
+      ansible.builtin.command: vgcreate elkvg /dev/sdb
+      when: vg_check.rc != 0
+
+    - name: Check if logical volume elklv already exists
+      ansible.builtin.command: lvs elkvg/elklv
+      register: lv_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create logical volume elklv using 100% of elkvg
+      ansible.builtin.command: lvcreate -l 100%FREE -n elklv elkvg
+      when: lv_check.rc != 0
+
+    - name: Check if /dev/elkvg/elklv is already formatted as XFS
+      ansible.builtin.command: blkid -s TYPE -o value /dev/elkvg/elklv
+      register: fs_check
+      failed_when: false
+      changed_when: false
+
+    - name: Format /dev/elkvg/elklv as XFS
+      ansible.builtin.command: mkfs.xfs /dev/elkvg/elklv
+      when: fs_check.stdout.strip() != 'xfs'
+
+    - name: Ensure /data0 mount point exists
+      ansible.builtin.file:
+        path: /data0
+        state: directory
+        mode: '0755'
+
+    - name: Mount /data0 and persist in fstab
+      ansible.builtin.mount:
+        path: /data0
+        src: /dev/elkvg/elklv
+        fstype: xfs
+        opts: defaults,nofail,x-systemd.device-timeout=10
+        state: mounted
+
+
+# ============================================================
+# Play 2: ES-specific tuning — ES and monitoring nodes only
+# ============================================================
+- name: Elasticsearch-specific host preparation
+  hosts: elastic_master_nodes:elastic_data_nodes:monitoring_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    # ----------------------------------------------------------
+    # ES-specific kernel settings
+    # ----------------------------------------------------------
+    - name: Set vm.max_map_count=1048576
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        line: "vm.max_map_count=1048576"
+        state: present
+        create: true
+        backup: true
+
+    - name: Set net.ipv4.tcp_retries2=5
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        line: "net.ipv4.tcp_retries2=5"
+        state: present
+        create: true
+        backup: true
+
+    - name: Apply sysctl changes
+      ansible.builtin.command: sysctl -p
+      changed_when: false
+
+    # ----------------------------------------------------------
+    # Elasticsearch user and directories
+    # ----------------------------------------------------------
+    - name: Ensure elasticsearch group exists
+      ansible.builtin.group:
+        name: elasticsearch
+        gid: 1500
+        state: present
+
+    - name: Ensure elasticsearch user exists
+      ansible.builtin.user:
+        name: elasticsearch
+        uid: 1500
+        group: elasticsearch
+        shell: /sbin/nologin
+        create_home: false
+        state: present
+
+    - name: Ensure ES data directory is owned by elasticsearch
+      ansible.builtin.file:
+        path: /data0
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '2750'
+
+    - name: Ensure ES log directory exists and is owned by elasticsearch
+      ansible.builtin.file:
+        path: /var/log/elasticsearch
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '2750'

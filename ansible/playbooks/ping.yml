@@ -1,0 +1,8 @@
+---
+- name: Ping all nodes
+  hosts: all_cluster_nodes
+  gather_facts: false
+
+  tasks:
+    - name: Ping
+      ansible.builtin.ping:

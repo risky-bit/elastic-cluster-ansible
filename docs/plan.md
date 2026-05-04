@@ -27,7 +27,7 @@ Three phases: learn on laptop, set up automation host, deploy to production. No 
 | Step | Action | Output |
 |---|---|---|
 | B1 | Install Ansible and dependencies on automation host (offline RPM) | Ansible available on host |
-| B2 | Clone repo to automation host | Repo on host |
+| B2 | Copy Ansible files to automation host (manual transfer — no git) | Working files on host |
 | B3 | Distribute SSH keys from automation host to all cluster nodes | Passwordless SSH confirmed |
 | B4 | Configure `ansible/ansible.cfg` for the production inventory | `ansible/ansible.cfg` |
 | B5 | Populate `ansible/inventory/prod.ini` (gitignored) with real IPs and hostnames | Gitignored inventory file |

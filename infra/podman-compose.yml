@@ -13,7 +13,7 @@ services:
       - ${SEMAPHORE_STORAGE_DIR:-/data/semaphore}/postgres:/var/lib/postgresql/data:Z
 
   semaphore:
-    image: ${SEMAPHORE_IMAGE:-moi-semaphore:v2.17.37-ansible2.17}
+    image: ${SEMAPHORE_IMAGE:-semaphoreui/semaphore:v2.17.37-ansible2.16.5}
     container_name: semaphore
     restart: unless-stopped
     depends_on:
@@ -28,16 +28,14 @@ services:
       SEMAPHORE_DB_USER: ${SEMAPHORE_DB_USER:-semaphore}
       SEMAPHORE_DB_PASS: ${SEMAPHORE_DB_PASSWORD:-semaphore}
       SEMAPHORE_ACCESS_KEY_ENCRYPTION: ${SEMAPHORE_ACCESS_KEY_ENCRYPTION:-changeme-change-me-change-me-change-me}
-      SEMAPHORE_PLAYBOOK_PATH: /workspace/moi-k8s-cluster/playbooks
+      SEMAPHORE_PLAYBOOK_PATH: /workspace/elastic-ansible/ansible/playbooks
       SEMAPHORE_ADMIN: ${SEMAPHORE_ADMIN:-admin}
       SEMAPHORE_ADMIN_PASSWORD: ${SEMAPHORE_ADMIN_PASSWORD:-changeme}
       SEMAPHORE_ADMIN_NAME: ${SEMAPHORE_ADMIN_NAME:-Admin}
       SEMAPHORE_ADMIN_EMAIL: ${SEMAPHORE_ADMIN_EMAIL:-admin@localhost}
       SEMAPHORE_WEB_ROOT: ${SEMAPHORE_WEB_ROOT:-}
-      KUBESPRAY_SSH_PASSWORD: ${KUBESPRAY_SSH_PASSWORD:-}
     volumes:
       - ${SEMAPHORE_STORAGE_DIR:-/data/semaphore}/data:/var/lib/semaphore:Z
       - ${SEMAPHORE_STORAGE_DIR:-/data/semaphore}/config:/etc/semaphore:Z
       - ${SEMAPHORE_STORAGE_DIR:-/data/semaphore}/tmp:/tmp/semaphore:Z
-      - ${WORKSPACE_DIR:-..}:/workspace/moi-k8s-cluster:Z
-      - ${ARTIFACTS_DIR:-../artifacts}:/srv/moi/artifacts:ro,Z
+      - ${WORKSPACE_DIR:-..}:/workspace/elastic-ansible:Z

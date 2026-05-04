@@ -1,0 +1,22 @@
+---
+# Elasticsearch version — must match RPM filenames in binaries/
+es_version: "9.3.4"
+
+# Cluster settings
+cluster_name: "placeholder-update-before-deploy"
+http_port: 9200
+transport_port: 9300
+
+# Data and log paths (matches /data0 mounted by prepare-hosts.yml)
+path_data: /data0
+path_logs: /var/log/elasticsearch
+
+# JVM heap per node type
+es_heap_master: "8g"
+es_heap_data: "31g"
+es_heap_monitoring: "16g"
+
+# Certificate paths on target nodes
+es_cert_dir: /etc/elasticsearch/certificates
+es_cert_file: "{{ es_cert_dir }}/elastic-certificates.p12"
+es_ca_file: "{{ es_cert_dir }}/elastic-stack-ca.p12"
