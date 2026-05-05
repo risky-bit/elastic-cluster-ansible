@@ -14,9 +14,6 @@
       ansible.builtin.include_vars:
         file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
 
-    # ----------------------------------------------------------
-    # Install
-    # ----------------------------------------------------------
     - name: Copy Elasticsearch RPM to node
       ansible.builtin.copy:
         src: /workspace/elastic-ansible/binaries/elasticsearch-{{ es_version }}-x86_64.rpm
@@ -28,9 +25,6 @@
       args:
         creates: /usr/share/elasticsearch/bin/elasticsearch
 
-    # ----------------------------------------------------------
-    # JVM heap
-    # ----------------------------------------------------------
     - name: Set heap size fact
       ansible.builtin.set_fact:
         heap_size: "{{ es_heap_master if inventory_hostname in groups['elastic_master_nodes'] else es_heap_data }}"
@@ -45,9 +39,6 @@
         group: elasticsearch
         mode: '0660'
 
-    # ----------------------------------------------------------
-    # TLS certificates
-    # ----------------------------------------------------------
     - name: Ensure certificate directory exists
       ansible.builtin.file:
         path: /etc/elasticsearch/certificates
@@ -72,10 +63,15 @@
         group: elasticsearch
         mode: '0640'
 
-    # ----------------------------------------------------------
-    # Configuration
-    # ----------------------------------------------------------
-    - name: Render elasticsearch.yml
+    - name: Set SSL keystore passwords in Elasticsearch secure settings
+      ansible.builtin.shell: |
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.http.ssl.keystore.secure_password 2>/dev/null || true
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.transport.ssl.keystore.secure_password 2>/dev/null || true
+        echo "" | /usr/share/elasticsearch/bin/elasticsearch-keystore add --stdin xpack.security.http.ssl.keystore.secure_password
+        echo "" | /usr/share/elasticsearch/bin/elasticsearch-keystore add --stdin xpack.security.transport.ssl.keystore.secure_password
+      changed_when: true
+
+    - name: Render elasticsearch.yml (setup_mode true on masters, false on data nodes)
       ansible.builtin.template:
         src: /workspace/elastic-ansible/ansible/templates/elasticsearch.yml.j2
         dest: /etc/elasticsearch/elasticsearch.yml
@@ -83,11 +79,8 @@
         group: elasticsearch
         mode: '0660'
       vars:
-        setup_mode: "{{ true if inventory_hostname == groups['elastic_master_nodes'][0] else false }}"
+        setup_mode: "{{ true if inventory_hostname in groups['elastic_master_nodes'] else false }}"
 
-    # ----------------------------------------------------------
-    # Ensure data and log directories owned by elasticsearch
-    # ----------------------------------------------------------
     - name: Ensure data directory ownership
       ansible.builtin.file:
         path: "{{ path_data }}"
@@ -106,10 +99,10 @@
 
 
 # ============================================================
-# Play 2: Bootstrap first master
+# Play 2: Start ALL master nodes simultaneously
 # ============================================================
-- name: Bootstrap first master node
-  hosts: es_bootstrap_node
+- name: Start all master nodes together
+  hosts: elastic_master_nodes
   become: true
   gather_facts: false
 
@@ -119,7 +112,7 @@
       ansible.builtin.include_vars:
         file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
 
-    - name: Enable and start Elasticsearch on bootstrap node
+    - name: Enable and start Elasticsearch
       ansible.builtin.systemd:
         name: elasticsearch
         enabled: true
@@ -137,52 +130,12 @@
       delay: 15
       until: es_boot is succeeded
 
-    - name: Reset elastic user password
-      ansible.builtin.command: >
-        /usr/share/elasticsearch/bin/elasticsearch-reset-password
-        -u elastic -b
-        --url https://{{ bind_ip }}:{{ http_port }}
-        -E xpack.security.http.ssl.verification_mode=none
-      register: elastic_pwd_output
-      changed_when: true
-
-    - name: Extract elastic password
-      ansible.builtin.set_fact:
-        elastic_password: "{{ (elastic_pwd_output.stdout | regex_search('New value:\\s*(\\S+)', '\\1'))[0] }}"
-
-    - name: Reset kibana_system user password
-      ansible.builtin.command: >
-        /usr/share/elasticsearch/bin/elasticsearch-reset-password
-        -u kibana_system -b
-        --url https://{{ bind_ip }}:{{ http_port }}
-        -E xpack.security.http.ssl.verification_mode=none
-      register: kibana_pwd_output
-      changed_when: true
-
-    - name: Extract kibana_system password
-      ansible.builtin.set_fact:
-        kibana_system_password: "{{ (kibana_pwd_output.stdout | regex_search('New value:\\s*(\\S+)', '\\1'))[0] }}"
-
-    - name: Display generated passwords
-      ansible.builtin.debug:
-        msg:
-          - "elastic password: {{ elastic_password }}"
-          - "kibana_system password: {{ kibana_system_password }}"
-
-    - name: Save passwords to file on bootstrap node
-      ansible.builtin.copy:
-        dest: /root/es-credentials.txt
-        content: |
-          elastic: {{ elastic_password }}
-          kibana_system: {{ kibana_system_password }}
-        mode: '0600'
-
 
 # ============================================================
-# Play 3: Start all remaining nodes
+# Play 3: Start data nodes one at a time
 # ============================================================
-- name: Start Elasticsearch on all remaining nodes
-  hosts: elastic_master_nodes:elastic_data_nodes
+- name: Start Elasticsearch on data nodes
+  hosts: elastic_data_nodes
   become: true
   gather_facts: false
   serial: 1
@@ -213,9 +166,74 @@
 
 
 # ============================================================
-# Play 4: Verify cluster and remove initial_master_nodes
+# Play 4: Reset passwords — after data nodes joined
 # ============================================================
-- name: Verify cluster and finalise configuration
+- name: Reset built-in user passwords
+  hosts: es_bootstrap_node
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Wait for cluster to stabilise and security index to allocate
+      ansible.builtin.pause:
+        seconds: 60
+
+    - name: Reset elastic user password
+      ansible.builtin.command: >
+        /usr/share/elasticsearch/bin/elasticsearch-reset-password
+        -u elastic -b -f
+        --url https://{{ bind_ip }}:{{ http_port }}
+        -E xpack.security.http.ssl.verification_mode=none
+      register: elastic_pwd_output
+      changed_when: true
+      retries: 5
+      delay: 30
+      until: elastic_pwd_output.rc == 0
+
+    - name: Extract elastic password
+      ansible.builtin.set_fact:
+        elastic_password: "{{ (elastic_pwd_output.stdout | regex_search('New value:\\s*(\\S+)', '\\1'))[0] }}"
+
+    - name: Reset kibana_system user password
+      ansible.builtin.command: >
+        /usr/share/elasticsearch/bin/elasticsearch-reset-password
+        -u kibana_system -b -f
+        --url https://{{ bind_ip }}:{{ http_port }}
+        -E xpack.security.http.ssl.verification_mode=none
+      register: kibana_pwd_output
+      changed_when: true
+      retries: 5
+      delay: 30
+      until: kibana_pwd_output.rc == 0
+
+    - name: Extract kibana_system password
+      ansible.builtin.set_fact:
+        kibana_system_password: "{{ (kibana_pwd_output.stdout | regex_search('New value:\\s*(\\S+)', '\\1'))[0] }}"
+
+    - name: Display generated passwords
+      ansible.builtin.debug:
+        msg:
+          - "elastic password: {{ elastic_password }}"
+          - "kibana_system password: {{ kibana_system_password }}"
+
+    - name: Save passwords to file on bootstrap node
+      ansible.builtin.copy:
+        dest: /root/es-credentials.txt
+        content: |
+          elastic: {{ elastic_password }}
+          kibana_system: {{ kibana_system_password }}
+        mode: '0600'
+
+
+# ============================================================
+# Play 5: Verify cluster health
+# ============================================================
+- name: Verify cluster health
   hosts: es_bootstrap_node
   become: true
   gather_facts: false
@@ -241,10 +259,26 @@
       ansible.builtin.assert:
         that:
           - cluster_health.json.status in ['green', 'yellow']
-        fail_msg: "Cluster health is {{ cluster_health.json.status }}. Check logs before proceeding."
-        success_msg: "Cluster health is {{ cluster_health.json.status }}."
+        fail_msg: "Cluster health is {{ cluster_health.json.status }}."
+        success_msg: "Cluster health is {{ cluster_health.json.status }}. Nodes: {{ cluster_health.json.number_of_nodes }}"
 
-    - name: Remove initial_master_nodes — render production config on bootstrap node
+
+# ============================================================
+# Play 6: Render production config on all masters
+#          Each host uses its own inventory variables — no delegation
+# ============================================================
+- name: Render production elasticsearch.yml on all masters
+  hosts: elastic_master_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Render production config (removes initial_master_nodes)
       ansible.builtin.template:
         src: /workspace/elastic-ansible/ansible/templates/elasticsearch.yml.j2
         dest: /etc/elasticsearch/elasticsearch.yml
@@ -254,12 +288,28 @@
       vars:
         setup_mode: false
 
-    - name: Restart bootstrap node with production config
+
+# ============================================================
+# Play 7: Rolling restart masters — one at a time with wait
+# ============================================================
+- name: Rolling restart master nodes
+  hosts: elastic_master_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Restart Elasticsearch
       ansible.builtin.systemd:
         name: elasticsearch
         state: restarted
 
-    - name: Wait for bootstrap node to rejoin
+    - name: Wait for node to rejoin cluster
       ansible.builtin.uri:
         url: "https://{{ bind_ip }}:{{ http_port }}"
         method: GET

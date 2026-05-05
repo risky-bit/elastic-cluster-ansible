@@ -22,10 +22,10 @@ http.port: {{ http_port }}
 transport.port: {{ transport_port }}
 
 # --------------------------------- Discovery ----------------------------------
-{% if setup_mode | default(false) and inventory_hostname == groups['elastic_master_nodes'][0] %}
+{% if setup_mode | default(false) %}
 cluster.initial_master_nodes: [{% for host in groups['elastic_master_nodes'] %}"{{ host }}"{% if not loop.last %}, {% endif %}{% endfor %}]
 {% endif %}
-discovery.seed_hosts: [{% for host in groups['elastic_master_nodes'] %}"{{ host }}:{{ transport_port }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+discovery.seed_hosts: [{% for host in groups['elastic_master_nodes'] %}"{{ hostvars[host]['bind_ip'] }}:{{ transport_port }}"{% if not loop.last %}, {% endif %}{% endfor %}]
 
 # ---------------------------------- Various -----------------------------------
 action.destructive_requires_name: true
