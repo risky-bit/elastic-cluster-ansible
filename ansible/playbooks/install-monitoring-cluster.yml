@@ -1,0 +1,278 @@
+---
+# Prerequisites:
+#   - monitoring_cluster_name must be set in prod.ini under [monitoring_nodes:vars]
+#   - Certs for monitoring nodes must exist under /workspace/elastic-ansible/certs/<hostname>/
+#   - prepare-hosts.yml must have run on monitoring nodes
+
+# ============================================================
+# Play 1: Install and configure all monitoring nodes
+# ============================================================
+- name: Install and configure monitoring cluster nodes
+  hosts: monitoring_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Set monitoring cluster name
+      ansible.builtin.set_fact:
+        cluster_name: "{{ monitoring_cluster_name }}"
+
+    - name: Copy Elasticsearch RPM to node
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/binaries/elasticsearch-{{ es_version }}-x86_64.rpm
+        dest: /tmp/elasticsearch-{{ es_version }}-x86_64.rpm
+        mode: '0644'
+
+    - name: Install Elasticsearch RPM
+      ansible.builtin.command: rpm -Uvh /tmp/elasticsearch-{{ es_version }}-x86_64.rpm
+      args:
+        creates: /usr/share/elasticsearch/bin/elasticsearch
+
+    - name: Configure JVM heap
+      ansible.builtin.copy:
+        dest: /etc/elasticsearch/jvm.options.d/heap.options
+        content: |
+          -Xms{{ es_heap_monitoring }}
+          -Xmx{{ es_heap_monitoring }}
+        owner: root
+        group: elasticsearch
+        mode: '0660'
+
+    - name: Ensure certificate directory exists
+      ansible.builtin.file:
+        path: /etc/elasticsearch/certificates
+        state: directory
+        owner: root
+        group: elasticsearch
+        mode: '0750'
+
+    - name: Copy node certificate
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/certs/{{ inventory_hostname }}/{{ inventory_hostname }}.p12
+        dest: /etc/elasticsearch/certificates/{{ inventory_hostname }}.p12
+        owner: root
+        group: elasticsearch
+        mode: '0640'
+
+    - name: Copy CA certificate
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/certs/elastic-stack-ca.p12
+        dest: /etc/elasticsearch/certificates/elastic-stack-ca.p12
+        owner: root
+        group: elasticsearch
+        mode: '0640'
+
+    - name: Set SSL keystore passwords in Elasticsearch secure settings
+      ansible.builtin.shell: |
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.http.ssl.keystore.secure_password 2>/dev/null || true
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.transport.ssl.keystore.secure_password 2>/dev/null || true
+        echo "" | /usr/share/elasticsearch/bin/elasticsearch-keystore add --stdin xpack.security.http.ssl.keystore.secure_password
+        echo "" | /usr/share/elasticsearch/bin/elasticsearch-keystore add --stdin xpack.security.transport.ssl.keystore.secure_password
+      changed_when: true
+
+    - name: Render elasticsearch.yml (setup mode — includes initial_master_nodes)
+      ansible.builtin.template:
+        src: /workspace/elastic-ansible/ansible/templates/elasticsearch-monitoring.yml.j2
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: elasticsearch
+        mode: '0660'
+      vars:
+        setup_mode: true
+
+    - name: Ensure data directory ownership
+      ansible.builtin.file:
+        path: "{{ path_data }}"
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '2750'
+
+    - name: Ensure log directory ownership
+      ansible.builtin.file:
+        path: "{{ path_logs }}"
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '2750'
+
+
+# ============================================================
+# Play 2: Start all monitoring nodes simultaneously
+# ============================================================
+- name: Start all monitoring nodes together
+  hosts: monitoring_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Enable and start Elasticsearch
+      ansible.builtin.systemd:
+        name: elasticsearch
+        enabled: true
+        daemon_reload: true
+        state: started
+
+    - name: Wait for Elasticsearch HTTP to respond
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ http_port }}"
+        method: GET
+        validate_certs: false
+        status_code: [200, 401, 403]
+      register: es_boot
+      retries: 30
+      delay: 15
+      until: es_boot is succeeded
+
+
+# ============================================================
+# Play 3: Reset passwords
+# ============================================================
+- name: Reset built-in user passwords
+  hosts: monitoring_nodes
+  become: true
+  gather_facts: false
+  run_once: true
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Wait for cluster to stabilise and security index to allocate
+      ansible.builtin.pause:
+        seconds: 60
+
+    - name: Reset elastic user password
+      ansible.builtin.command: >
+        /usr/share/elasticsearch/bin/elasticsearch-reset-password
+        -u elastic -b -f
+        --url https://{{ bind_ip }}:{{ http_port }}
+        -E xpack.security.http.ssl.verification_mode=none
+      register: elastic_pwd_output
+      changed_when: true
+      retries: 5
+      delay: 30
+      until: elastic_pwd_output.rc == 0
+
+    - name: Extract elastic password
+      ansible.builtin.set_fact:
+        mon_elastic_password: "{{ (elastic_pwd_output.stdout | regex_search('New value:\\s*(\\S+)', '\\1'))[0] }}"
+
+    - name: Display generated password
+      ansible.builtin.debug:
+        msg: "elastic password: {{ mon_elastic_password }}"
+
+    - name: Save password to file
+      ansible.builtin.copy:
+        dest: /root/mon-credentials.txt
+        content: |
+          elastic: {{ mon_elastic_password }}
+        mode: '0600'
+
+
+# ============================================================
+# Play 4: Verify cluster health
+# ============================================================
+- name: Verify monitoring cluster health
+  hosts: monitoring_nodes
+  become: true
+  gather_facts: false
+  run_once: true
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Query cluster health
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ http_port }}/_cluster/health"
+        method: GET
+        user: elastic
+        password: "{{ hostvars[inventory_hostname].mon_elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: cluster_health
+
+    - name: Assert cluster is green or yellow
+      ansible.builtin.assert:
+        that:
+          - cluster_health.json.status in ['green', 'yellow']
+        fail_msg: "Cluster health is {{ cluster_health.json.status }}."
+        success_msg: "Cluster health is {{ cluster_health.json.status }}. Nodes: {{ cluster_health.json.number_of_nodes }}"
+
+
+# ============================================================
+# Play 5: Render production config (removes initial_master_nodes)
+# ============================================================
+- name: Render production elasticsearch.yml on all monitoring nodes
+  hosts: monitoring_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Set monitoring cluster name
+      ansible.builtin.set_fact:
+        cluster_name: "{{ monitoring_cluster_name }}"
+
+    - name: Render production config
+      ansible.builtin.template:
+        src: /workspace/elastic-ansible/ansible/templates/elasticsearch-monitoring.yml.j2
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: elasticsearch
+        mode: '0660'
+      vars:
+        setup_mode: false
+
+
+# ============================================================
+# Play 6: Rolling restart to apply production config
+# ============================================================
+- name: Rolling restart monitoring nodes
+  hosts: monitoring_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Restart Elasticsearch
+      ansible.builtin.systemd:
+        name: elasticsearch
+        state: restarted
+
+    - name: Wait for node to rejoin cluster
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ http_port }}"
+        method: GET
+        validate_certs: false
+        status_code: [200, 401, 403]
+      register: rejoin_check
+      retries: 20
+      delay: 15
+      until: rejoin_check is succeeded

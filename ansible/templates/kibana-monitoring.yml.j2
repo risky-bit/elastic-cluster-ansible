@@ -1,0 +1,32 @@
+
+# ---------------------------------- Server ------------------------------------
+server.port: {{ kibana_port | default(5601) }}
+server.host: "0.0.0.0"
+server.name: "{{ inventory_hostname }}"
+server.publicBaseUrl: "{{ mon_kibana_public_url | default('https://' + bind_ip + ':5601') }}"
+
+# ---------------------------------- Server SSL --------------------------------
+server.ssl.enabled: true
+server.ssl.keystore.path: /etc/kibana/certificates/{{ inventory_hostname }}.p12
+server.ssl.keystore.password: ""
+
+# ---------------------------------- Elasticsearch ----------------------------
+elasticsearch.hosts: [{% for host in groups['monitoring_nodes'] %}"https://{{ hostvars[host]['bind_ip'] }}:{{ http_port }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+elasticsearch.username: "kibana_system"
+elasticsearch.password: "{{ mon_kibana_system_password }}"
+
+# ---------------------------------- Elasticsearch SSL ------------------------
+elasticsearch.ssl.verificationMode: "certificate"
+elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certificates/ca.crt"]
+
+# ---------------------------------- Encryption keys --------------------------
+xpack.encryptedSavedObjects.encryptionKey: "{{ mon_kibana_encryption_key }}"
+xpack.security.encryptionKey: "{{ mon_kibana_security_key }}"
+xpack.reporting.encryptionKey: "{{ mon_kibana_reporting_key }}"
+
+# ---------------------------------- Monitoring --------------------------------
+monitoring.kibana.collection.enabled: true
+monitoring.ui.ccs.enabled: false
+
+# ---------------------------------- Air-gap -----------------------------------
+xpack.fleet.isAirGapped: true
