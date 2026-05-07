@@ -13,6 +13,7 @@ node.roles: [ {% for role in node_roles_list %}{{ role }}{% if not loop.last %},
 # ----------------------------------- Paths ------------------------------------
 path.data: {{ path_data }}
 path.logs: {{ path_logs }}
+path.repo: ["/mnt/es_snapshots"]
 
 # ---------------------------------- Network -----------------------------------
 network.host: "{{ bind_ip }}"

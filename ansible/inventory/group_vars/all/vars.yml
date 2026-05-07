@@ -6,6 +6,7 @@ es_version: "9.3.4"
 cluster_name: "placeholder-update-before-deploy"
 http_port: 9200
 transport_port: 9300
+kibana_port: 5601
 
 # Data and log paths (matches /data0 mounted by prepare-hosts.yml)
 path_data: /data0

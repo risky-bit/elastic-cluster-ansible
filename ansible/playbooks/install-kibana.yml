@@ -1,0 +1,124 @@
+---
+- name: Install and configure Kibana
+  hosts: kibana_logstash_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Load secrets
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/secrets.yml
+
+    # ----------------------------------------------------------
+    # Install
+    # ----------------------------------------------------------
+    - name: Copy Kibana RPM to node
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/binaries/kibana-{{ es_version }}-x86_64.rpm
+        dest: /tmp/kibana-{{ es_version }}-x86_64.rpm
+        mode: '0644'
+
+    - name: Install Kibana RPM
+      ansible.builtin.command: rpm -Uvh /tmp/kibana-{{ es_version }}-x86_64.rpm
+      args:
+        creates: /usr/share/kibana/bin/kibana
+
+    # ----------------------------------------------------------
+    # TLS certificates
+    # ----------------------------------------------------------
+    - name: Ensure certificate directory exists
+      ansible.builtin.file:
+        path: /etc/kibana/certificates
+        state: directory
+        owner: root
+        group: kibana
+        mode: '0750'
+
+    - name: Copy node certificate
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/certs/{{ inventory_hostname }}/{{ inventory_hostname }}.p12
+        dest: /etc/kibana/certificates/{{ inventory_hostname }}.p12
+        owner: root
+        group: kibana
+        mode: '0640'
+
+    - name: Copy CA certificate (PKCS12)
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/certs/elastic-stack-ca.p12
+        dest: /etc/kibana/certificates/elastic-stack-ca.p12
+        owner: root
+        group: kibana
+        mode: '0640'
+
+    - name: Extract CA certificate as PEM for Elasticsearch SSL trust
+      ansible.builtin.command: >
+        openssl pkcs12
+        -legacy
+        -in /etc/kibana/certificates/elastic-stack-ca.p12
+        -nokeys
+        -out /etc/kibana/certificates/ca.crt
+        -passin pass:
+      args:
+        creates: /etc/kibana/certificates/ca.crt
+
+    - name: Set CA certificate ownership
+      ansible.builtin.file:
+        path: /etc/kibana/certificates/ca.crt
+        owner: root
+        group: kibana
+        mode: '0640'
+
+    # ----------------------------------------------------------
+    # Configuration
+    # ----------------------------------------------------------
+    - name: Render kibana.yml
+      ansible.builtin.template:
+        src: /workspace/elastic-ansible/ansible/templates/kibana.yml.j2
+        dest: /etc/kibana/kibana.yml
+        owner: root
+        group: kibana
+        mode: '0660'
+      notify: Restart Kibana
+
+    # ----------------------------------------------------------
+    # Start
+    # ----------------------------------------------------------
+    - name: Enable and start Kibana
+      ansible.builtin.systemd:
+        name: kibana
+        enabled: true
+        daemon_reload: true
+        state: started
+
+  handlers:
+    - name: Restart Kibana
+      ansible.builtin.systemd:
+        name: kibana
+        state: restarted
+
+    - name: Pause to allow Kibana to start or fail fast
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Verify Kibana service is still running
+      ansible.builtin.command: systemctl is-active kibana
+      register: kibana_active
+      failed_when: kibana_active.stdout != "active"
+      changed_when: false
+
+    - name: Wait for Kibana to be accessible
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ kibana_port | default(5601) }}/api/status"
+        method: GET
+        validate_certs: false
+        status_code: [200, 401, 403, 503]
+      register: kibana_check
+      retries: 40
+      delay: 15
+      until: kibana_check.status in [200, 401, 403]
