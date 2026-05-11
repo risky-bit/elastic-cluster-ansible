@@ -1,0 +1,91 @@
+Deploying a Production Elasticsearch Cluster with Ansible
+==========================================================
+
+A practitioner's guide to building a fully automated, air-gapped,
+TLS-secured Elastic Stack deployment from scratch.
+
+---
+
+OUTLINE
+-------
+
+01 - Why Ansible for Elasticsearch
+     - The problem with manual ES deployments at scale
+     - What Ansible brings: idempotency, repeatability, auditability
+     - Air-gapped constraint and what it changes
+
+02 - Architecture
+     - What we're building: 8-node production cluster + monitoring tier
+     - Node roles: dedicated masters vs data+ingest
+     - Zone-aware shard allocation
+     - Kibana HA, Fleet Server, monitoring cluster
+     - The automation host and why it stays dedicated
+
+03 - Host Preparation
+     - sysctl tuning (vm.max_map_count, file descriptors)
+     - Disk formatting and mounting (XFS, /data0)
+     - elasticsearch OS user with consistent UID/GID across fleet
+     - Why consistent UID/GID matters for NFS
+
+04 - PKI and TLS
+     - elasticsearch-certutil: why not openssl directly
+     - CA generation, instances.yml, per-node PKCS12 certs
+     - The -legacy flag on OpenSSL 3.x: a subtle RHEL 9 gotcha
+     - What gets a cert: ES nodes, Kibana nodes, Fleet Server nodes
+
+05 - Elasticsearch Cluster Deployment
+     - The bootstrap problem: initial_master_nodes and cluster UUID
+     - Why you start all masters simultaneously (not serial)
+     - Roles, zones, and heap per node type
+     - Password reset timing: why it must happen after data nodes join
+     - Removing initial_master_nodes: the rolling restart
+
+06 - Kibana Deployment
+     - HA Kibana: shared encryption keys are non-negotiable
+     - Air-gap mode: xpack.fleet.isAirGapped
+     - CCS and monitoring.ui.ccs.enabled: the hidden default that bites you
+     - Waiting for Kibana: why 503 is not a failure
+
+07 - Snapshot Repository and SLM
+     - path.repo: the whitelist requirement before any snapshot works
+     - Rolling reconfiguration playbook: disable allocation, restart, wait for green
+     - NFS verification: always test restore before trusting the backup
+
+08 - Monitoring Cluster
+     - Why a separate cluster: independence from what you're monitoring
+     - 3-node all-roles vs split-role for small clusters
+     - Kibana HA on monitoring nodes
+     - The cluster_name variable trap: how a placeholder brought down a node
+
+09 - Fleet Server
+     - Elastic Agent flavors in 9.x: the basic vs servers split
+     - --install-servers: the flag that wasn't in the docs
+     - HA Fleet Server: two nodes, one F5 VIP
+
+10 - Elastic Agents and Monitoring Data
+     - Shipping production cluster metrics to monitoring cluster
+     - Disabling internal collection after agents are verified
+     - System integration for OS logs
+
+11 - NGINX as Auditable Reverse Proxy
+     - Not in front of Kibana: in front of production ES
+     - Audit log requirements and placement decisions
+     - Phase 9: why dedicated boxes are the right end state
+
+12 - Lessons Learned
+     - Semaphore static inventory: the gotcha that bit us on cluster_name
+     - Variable precedence in Ansible: include_vars overrides group_vars
+     - Bearer auth scheme in ES 9.x and Ansible's URI module
+     - Test your restore before you need it
+     - The cost of wrong ordering: password reset before data nodes join
+
+---
+
+FORMAT NOTES
+------------
+- Each section gets its own txt file (01-why-ansible.txt, 02-architecture.txt, etc.)
+- Write as a practitioner, not a vendor: include what went wrong and why
+- No org names, real IPs, real hostnames — use generic placeholders
+- Code blocks where relevant
+- Target audience: senior engineer who knows Linux and has touched ES before
+  but hasn't automated a full stack deployment
