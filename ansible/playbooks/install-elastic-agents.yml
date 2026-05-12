@@ -1,0 +1,193 @@
+---
+# Deploys Elastic Agents on all production ES nodes (masters + data).
+# Agents enroll in the production-es-monitoring policy and send data
+# to the monitoring cluster output.
+#
+# Prerequisites:
+#   - elastic-agent-{{ es_version }}-linux-x86_64.tar.gz in binaries/
+#   - Fleet Server running on kibana_logstash_nodes
+#   - mon_elastic_password, ca_fingerprint in secrets.yml
+#   - fleet-server-policy exists in Kibana Fleet
+#
+# After running this playbook:
+#   - Add Elasticsearch integration to the policy in Kibana UI
+#   - Add System integration to the policy in Kibana UI
+#   - Verify data flowing to monitoring cluster
+#   - Then disable xpack.monitoring.collection.enabled on production cluster
+
+# ============================================================
+# Play 1: Create monitoring output and agent policy in Fleet
+# ============================================================
+- name: Set up Fleet monitoring output and agent policy
+  hosts: kibana_logstash_nodes
+  become: true
+  gather_facts: false
+  run_once: true
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Load secrets
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/secrets.yml
+
+    # monitoring-cluster output must be created manually in Kibana UI first:
+    # Fleet → Settings → Outputs → Add output
+    # Type: Elasticsearch, hosts: monitoring nodes :9200, CA fingerprint, username/password
+
+    - name: Get monitoring output ID
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ kibana_port | default(5601) }}/api/fleet/outputs"
+        method: GET
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        headers:
+          kbn-xsrf: "true"
+        status_code: [200]
+      register: outputs_list
+
+    - name: Debug outputs response
+      ansible.builtin.debug:
+        var: outputs_list.json
+
+    - name: Set monitoring output ID fact
+      ansible.builtin.set_fact:
+        monitoring_output_id: "{{ (outputs_list.json['items'] | selectattr('name', 'equalto', 'monitoring-cluster') | list).0.id }}"
+
+    - name: Create production-es-monitoring agent policy
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ kibana_port | default(5601) }}/api/fleet/agent_policies"
+        method: POST
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          name: "production-es-monitoring"
+          namespace: "default"
+          monitoring_enabled: ["logs", "metrics"]
+          data_output_id: "{{ monitoring_output_id }}"
+          monitoring_output_id: "{{ monitoring_output_id }}"
+        headers:
+          kbn-xsrf: "true"
+        status_code: [200, 409]
+
+    - name: Get production-es-monitoring policy ID
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ kibana_port | default(5601) }}/api/fleet/agent_policies?kuery=name:production-es-monitoring"
+        method: GET
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        headers:
+          kbn-xsrf: "true"
+        status_code: [200]
+      register: policy_list
+
+    - name: Set policy ID fact
+      ansible.builtin.set_fact:
+        agent_policy_id: "{{ policy_list.json['items'][0].id }}"
+
+    - name: Get enrollment token for policy
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ kibana_port | default(5601) }}/api/fleet/enrollment_api_keys?kuery=policy_id:{{ agent_policy_id }}"
+        method: GET
+        user: elastic
+        password: "{{ elastic_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        headers:
+          kbn-xsrf: "true"
+        status_code: [200]
+      register: token_list
+
+    - name: Set enrollment token fact
+      ansible.builtin.set_fact:
+        agent_enrollment_token: "{{ token_list.json['items'][0].api_key }}"
+
+    - name: Display enrollment token
+      ansible.builtin.debug:
+        msg: "Enrollment token: {{ agent_enrollment_token }}"
+
+
+# ============================================================
+# Play 2: Deploy Elastic Agents on all production ES nodes
+# ============================================================
+- name: Deploy Elastic Agents on production ES nodes
+  hosts: elastic_master_nodes:elastic_data_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Load secrets
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/secrets.yml
+
+    - name: Set enrollment token from Kibana play
+      ansible.builtin.set_fact:
+        agent_enrollment_token: "{{ hostvars[groups['kibana_logstash_nodes'][0]]['agent_enrollment_token'] }}"
+
+    # ----------------------------------------------------------
+    # Transfer and extract tar.gz
+    # ----------------------------------------------------------
+    - name: Copy Elastic Agent tar.gz to node
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/binaries/elastic-agent-{{ es_version }}-linux-x86_64.tar.gz
+        dest: /tmp/elastic-agent-{{ es_version }}-linux-x86_64.tar.gz
+        mode: '0644'
+
+    - name: Extract Elastic Agent tar.gz
+      ansible.builtin.unarchive:
+        src: /tmp/elastic-agent-{{ es_version }}-linux-x86_64.tar.gz
+        dest: /tmp/
+        remote_src: true
+        creates: /tmp/elastic-agent-{{ es_version }}-linux-x86_64
+
+    # ----------------------------------------------------------
+    # Extract CA cert PEM for Fleet Server trust
+    # ----------------------------------------------------------
+    - name: Extract CA cert as PEM from existing PKCS12
+      ansible.builtin.command: >
+        openssl pkcs12 -legacy
+        -in /etc/elasticsearch/certificates/elastic-stack-ca.p12
+        -nokeys
+        -out /etc/elasticsearch/certificates/ca.crt
+        -passin pass:
+      args:
+        creates: /etc/elasticsearch/certificates/ca.crt
+
+    # ----------------------------------------------------------
+    # Install and enroll
+    # ----------------------------------------------------------
+    - name: Install and enroll Elastic Agent
+      ansible.builtin.command: >
+        ./elastic-agent install
+        --url=https://{{ hostvars[groups['kibana_logstash_nodes'][0]]['bind_ip'] }}:8220
+        --enrollment-token={{ agent_enrollment_token }}
+        --certificate-authorities=/etc/elasticsearch/certificates/ca.crt
+        --force
+      args:
+        chdir: /tmp/elastic-agent-{{ es_version }}-linux-x86_64
+      changed_when: true
+
+    - name: Wait for Elastic Agent to be running
+      ansible.builtin.systemd:
+        name: elastic-agent
+        state: started
+      register: agent_status
+      retries: 10
+      delay: 10
+      until: agent_status is succeeded
