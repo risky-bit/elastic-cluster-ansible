@@ -1,0 +1,33 @@
+YAML that Ansible validates but Elasticsearch rejects on startup because a
+Jinja2 loop rendered discovery.seed_hosts as a child key of initial_master_nodes.
+An elastic-agent flag that the documentation says to use but the binary does
+not recognise. A service token that conflicts on the second playbook run
+because the first run failed halfway through and left state behind.
+Those are the loud ones. You see them, you fix them, you move on.
+
+The quiet ones are harder.
+
+Three master nodes that each bootstrapped as a healthy single-node cluster
+because the playbook started them serially instead of simultaneously.
+All three reported green. All three had different cluster UUIDs.
+No error anywhere until you queried _cat/nodes and saw one node instead of three.
+
+A node that joined the cluster reporting healthy, then fell off silently
+ten minutes later. The cause: a placeholder value in vars.yml had overridden
+the real cluster name when the config was rendered. The node was running,
+the service was active, Ansible reported success. It had just joined a
+different cluster — one that did not exist.
+
+A CA certificate that extracted empty from a PKCS12 file with no error,
+no warning, and no indication anything had gone wrong. OpenSSL 3.x on RHEL 9
+requires a -legacy flag for PKCS12 operations. Without it you get an empty
+file and a TLS error that points at the certificate, not the extraction.
+
+An encryption key that was 32 characters in the terminal and 31 in the
+config file. The trailing character was a plus sign. It dropped silently
+during copy-paste. Kibana started. Saved object encryption failed quietly.
+
+Automation makes the loud problems easier and the quiet ones more dangerous,
+because human review drops the more you trust the playbooks.
+The ones that got us were never in the error output.
+They were in the assumptions.

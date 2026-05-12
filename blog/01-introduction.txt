@@ -1,0 +1,25 @@
+First time automating the setup of a distributed system like Elasticsearch
+is an interesting journey. With so many components involved — cluster
+formation, TLS, node roles, shard allocation, monitoring, Fleet — there
+is a lot to get right. What makes it even more interesting is when you
+are involved in not just the cluster setup itself, but in all the decisions
+around it: VM sizing, networking, high availability, disaster recovery,
+load balancing, request tracking, and compliance.
+
+We have set up multiple Elastic stacks before, each time going through
+the full process manually — SSH into each node, configure, copy certs,
+start services, verify, repeat across every host.
+
+This time, we went the Ansible route.
+
+What we quickly realised is that setting up the automation layer before
+touching the cluster is a phase in itself. Inventory structure, variable
+management, secrets handling, idempotency — getting that foundation right
+before writing a single playbook against a production node matters more
+than it seems upfront.
+
+Over the next few posts we will walk through how we automated the full
+deployment of a production Elastic Stack on air-gapped RHEL 9:
+an 8-node Elasticsearch cluster, HA Kibana, Fleet Server, a dedicated
+monitoring cluster, and NGINX as an auditable reverse proxy.
+Including the parts that did not go to plan the first time.

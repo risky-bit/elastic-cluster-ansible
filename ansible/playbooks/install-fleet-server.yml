@@ -1,15 +1,17 @@
 ---
 # Prerequisites:
-#   - elastic-agent-{{ es_version }}-x86_64.rpm in /workspace/elastic-ansible/binaries/
-#   - elastic_password in secrets.yml
+#   - elastic-agent-9.3.4-linux-x86_64.tar.gz in /workspace/elastic-ansible/binaries/
+#   - elastic_password and fleet_server_service_token in secrets.yml
 #   - Kibana running on kibana_logstash_nodes
-#   - CA cert already extracted at /etc/kibana/certificates/ca.crt on LOGST nodes
+#   - CA cert at /etc/kibana/certificates/ca.crt on LOGST nodes
+#   - fleet-server-policy created in Kibana Fleet UI with Fleet Server integration attached
+#   - Node must be clean: no prior elastic-agent installation
 
 # ============================================================
-# Play 1: Generate Fleet Server service token
+# Play 1: Initialize Fleet in Kibana
 # ============================================================
-- name: Generate Fleet Server service token
-  hosts: elastic_master_nodes
+- name: Initialize Fleet in Kibana
+  hosts: kibana_logstash_nodes
   become: true
   gather_facts: false
   run_once: true
@@ -24,40 +26,23 @@
       ansible.builtin.include_vars:
         file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/secrets.yml
 
-    - name: Delete existing Fleet Server service token if present
+    - name: Initialize Fleet setup
       ansible.builtin.uri:
-        url: "https://{{ bind_ip }}:{{ http_port }}/_security/service/elastic/fleet-server/credential/token/fleet-server-token"
-        method: DELETE
-        user: elastic
-        password: "{{ elastic_password }}"
-        force_basic_auth: true
-        validate_certs: false
-        status_code: [200, 404]
-
-    - name: Generate Fleet Server service token
-      ansible.builtin.uri:
-        url: "https://{{ bind_ip }}:{{ http_port }}/_security/service/elastic/fleet-server/credential/token/fleet-server-token"
+        url: "https://{{ bind_ip }}:{{ kibana_port | default(5601) }}/api/fleet/setup"
         method: POST
         user: elastic
         password: "{{ elastic_password }}"
         force_basic_auth: true
         validate_certs: false
-        status_code: [200, 201]
-      register: token_response
-
-    - name: Set fleet server token fact
-      ansible.builtin.set_fact:
-        fleet_server_token: "{{ token_response.json.token.value }}"
-
-    - name: Display service token
-      ansible.builtin.debug:
-        msg: "Fleet Server service token: {{ fleet_server_token }}"
+        headers:
+          kbn-xsrf: "true"
+        status_code: [200]
 
 
 # ============================================================
-# Play 2: Install and enroll Fleet Server on LOGST nodes
+# Play 2: Install Fleet Server from tar.gz
 # ============================================================
-- name: Install and enroll Fleet Server
+- name: Install Fleet Server from tar.gz
   hosts: kibana_logstash_nodes
   become: true
   gather_facts: false
@@ -73,23 +58,21 @@
       ansible.builtin.include_vars:
         file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/secrets.yml
 
-    - name: Set Fleet Server token from master node
-      ansible.builtin.set_fact:
-        fleet_server_token: "{{ hostvars[groups['elastic_master_nodes'][0]]['fleet_server_token'] }}"
-
     # ----------------------------------------------------------
-    # Install
+    # Transfer and extract tar.gz
     # ----------------------------------------------------------
-    - name: Copy Elastic Agent RPM
+    - name: Copy Elastic Agent tar.gz to node
       ansible.builtin.copy:
-        src: /workspace/elastic-ansible/binaries/elastic-agent-{{ es_version }}-x86_64.rpm
-        dest: /tmp/elastic-agent-{{ es_version }}-x86_64.rpm
+        src: /workspace/elastic-ansible/binaries/elastic-agent-{{ es_version }}-linux-x86_64.tar.gz
+        dest: /tmp/elastic-agent-{{ es_version }}-linux-x86_64.tar.gz
         mode: '0644'
 
-    - name: Install Elastic Agent RPM
-      ansible.builtin.command: rpm -Uvh /tmp/elastic-agent-{{ es_version }}-x86_64.rpm
-      args:
-        creates: /usr/bin/elastic-agent
+    - name: Extract Elastic Agent tar.gz
+      ansible.builtin.unarchive:
+        src: /tmp/elastic-agent-{{ es_version }}-linux-x86_64.tar.gz
+        dest: /tmp/
+        remote_src: true
+        creates: /tmp/elastic-agent-{{ es_version }}-linux-x86_64
 
     # ----------------------------------------------------------
     # TLS certificates
@@ -138,26 +121,25 @@
         mode: '0600'
 
     # ----------------------------------------------------------
-    # Enroll as Fleet Server (servers flavor required for fleet-server component)
+    # Install as Fleet Server with servers flavor
     # ----------------------------------------------------------
-    - name: Uninstall existing Elastic Agent to allow clean re-install with servers flavor
-      ansible.builtin.command: /usr/bin/elastic-agent uninstall --force
-      failed_when: false
-      changed_when: true
-
-    - name: Install Elastic Agent as Fleet Server with servers flavor
+    - name: Install Elastic Agent as Fleet Server
       ansible.builtin.command: >
-        /usr/bin/elastic-agent install
+        ./elastic-agent install
         --url=https://{{ bind_ip }}:8220
         --fleet-server-es=https://{{ hostvars[groups['elastic_master_nodes'][0]]['bind_ip'] }}:{{ http_port }}
-        --fleet-server-service-token={{ fleet_server_token }}
+        --fleet-server-service-token={{ fleet_server_service_token }}
         --fleet-server-es-ca=/etc/kibana/certificates/ca.crt
         --fleet-server-cert=/etc/elastic-agent/certs/fleet-server.crt
         --fleet-server-cert-key=/etc/elastic-agent/certs/fleet-server.key
+        --certificate-authorities=/etc/kibana/certificates/ca.crt
         --fleet-server-policy=fleet-server-policy
         --fleet-server-port=8220
+        --fleet-server-timeout=10m
         --install-servers
         --force
+      args:
+        chdir: /tmp/elastic-agent-{{ es_version }}-linux-x86_64
       changed_when: true
 
     # ----------------------------------------------------------
@@ -173,40 +155,3 @@
       retries: 20
       delay: 15
       until: fleet_check.status in [200, 401, 403]
-
-
-# ============================================================
-# Play 3: Configure Fleet Server URL in Kibana
-# ============================================================
-- name: Configure Fleet settings in Kibana
-  hosts: kibana_logstash_nodes
-  become: true
-  gather_facts: false
-  run_once: true
-
-  tasks:
-
-    - name: Load global variables
-      ansible.builtin.include_vars:
-        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
-
-    - name: Load secrets
-      ansible.builtin.include_vars:
-        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/secrets.yml
-
-    - name: Configure Fleet Server hosts in Kibana
-      ansible.builtin.uri:
-        url: "https://{{ bind_ip }}:{{ kibana_port | default(5601) }}/api/fleet/settings"
-        method: PUT
-        user: elastic
-        password: "{{ elastic_password }}"
-        force_basic_auth: true
-        validate_certs: false
-        body_format: json
-        body:
-          fleet_server_hosts:
-            - "https://{{ hostvars[groups['kibana_logstash_nodes'][0]]['bind_ip'] }}:8220"
-            - "https://{{ hostvars[groups['kibana_logstash_nodes'][1]]['bind_ip'] }}:8220"
-        headers:
-          kbn-xsrf: "true"
-        status_code: [200]
