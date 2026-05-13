@@ -1,0 +1,382 @@
+Deployment Issues, Errors, and Fixes
+=====================================
+
+A running log of every non-obvious problem encountered during this deployment,
+including the error output and what fixed it. Updated at the end of each session.
+
+
+------------------------------------------------------------------------
+ISSUE 01 — YAML indentation: discovery.seed_hosts rendered as child key
+------------------------------------------------------------------------
+
+Phase: Elasticsearch cluster deployment
+Component: ansible/templates/elasticsearch.yml.j2
+
+Error:
+  Elasticsearch rejected the config on startup. The rendered YAML had
+  discovery.seed_hosts appearing as an indented child of initial_master_nodes
+  due to Jinja2 loop whitespace.
+
+  Relevant rendered output (wrong):
+    cluster.initial_master_nodes:
+      - "NDCELSTMN01"
+      - "NDCELSTMN02"
+      - "NDCELSTMN03"
+      discovery.seed_hosts:       ← rendered as child key
+        - "172.20.70.71:9300"
+
+Fix:
+  Switched from YAML block format to inline list format in the Jinja2 template:
+
+    discovery.seed_hosts: [{% for host in groups['elastic_master_nodes'] %}"{{ hostvars[host]['bind_ip'] }}:{{ transport_port }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+
+  This bypasses YAML indentation issues entirely.
+
+
+------------------------------------------------------------------------
+ISSUE 02 — Cluster UUID split-brain: masters started serially
+------------------------------------------------------------------------
+
+Phase: Elasticsearch cluster bootstrap
+Component: install-elasticsearch.yml
+
+Error:
+  All three master nodes reported healthy after starting. Cluster health
+  showed 1 node instead of 3. Each master had a different cluster UUID.
+
+  curl output on each master showed:
+    "cluster_uuid": "abc123..."  ← different on each node
+
+  No error in Ansible. No error in ES logs. All services active.
+
+Fix:
+  Masters must be started simultaneously, not serially. serial: 1 causes
+  each master to bootstrap as a single-node cluster before the others start.
+
+  Wiped /data0 on all masters. Rewrote the playbook to start all masters
+  in a single play without serial (no serial: N means all hosts run together).
+
+
+------------------------------------------------------------------------
+ISSUE 03 — Password reset failed: .security-7 could not allocate
+------------------------------------------------------------------------
+
+Phase: Elasticsearch cluster bootstrap
+Component: install-elasticsearch.yml
+
+Error:
+  elasticsearch-reset-password failed with:
+    "Cannot reset password for user [elastic]: .security-7 index is not available"
+
+Fix:
+  The .security-7 index needs data nodes to allocate its shards.
+  Password reset was moved to AFTER data nodes joined the cluster (Play 4
+  instead of Play 3). Added a 60-second pause before the reset to allow
+  the security index to allocate.
+
+
+------------------------------------------------------------------------
+ISSUE 04 — OpenSSL 3.x RHEL 9: silently empty CA certificate
+------------------------------------------------------------------------
+
+Phase: Kibana TLS setup
+Component: install-kibana.yml
+
+Error:
+  openssl pkcs12 -in elastic-stack-ca.p12 -nokeys -out ca.crt -passin pass:
+
+  Produced a zero-byte ca.crt with no error, no warning, no indication
+  anything went wrong. Kibana started but TLS failed with a certificate error
+  pointing at ca.crt — not at the extraction step.
+
+Fix:
+  OpenSSL 3.x on RHEL 9 requires the -legacy flag for PKCS12 operations:
+
+    openssl pkcs12 -legacy -in elastic-stack-ca.p12 -nokeys -out ca.crt -passin pass:
+
+  Without -legacy, the extraction silently produces an empty file.
+
+
+------------------------------------------------------------------------
+ISSUE 05 — Encryption key truncated during copy-paste
+------------------------------------------------------------------------
+
+Phase: Kibana deployment
+Component: ansible/inventory/group_vars/all/secrets.yml
+
+Error:
+  Kibana started successfully but saved object encryption silently failed.
+  The encryption key in secrets.yml was 31 characters. The required minimum
+  is 32. The trailing + character was dropped during copy-paste.
+
+Fix:
+  Generated a new key using Python to avoid shell character interpretation:
+
+    python3 -c "import secrets; print(secrets.token_hex(16))"
+
+  Verified length before saving.
+
+
+------------------------------------------------------------------------
+ISSUE 06 — Kibana 503 treated as failure in health check
+------------------------------------------------------------------------
+
+Phase: Kibana deployment
+Component: install-kibana.yml
+
+Error:
+  Ansible failed at "Wait for Kibana to be accessible" because Kibana
+  returns HTTP 503 during initialisation (not yet ready, but alive).
+  The task was only accepting 200/401/403.
+
+Fix:
+  Added 503 to the accepted status codes list and changed the until
+  condition to stop retrying only on 200/401/403:
+
+    status_code: [200, 401, 403, 503]
+    until: kibana_check.status in [200, 401, 403]
+
+  Kibana can take 5+ minutes to initialise on first start. Retries set
+  to 40 with 15-second delays.
+
+
+------------------------------------------------------------------------
+ISSUE 07 — monitoring.ui.ccs.enabled default causing log spam
+------------------------------------------------------------------------
+
+Phase: Kibana deployment
+Component: ansible/templates/kibana.yml.j2
+
+Error:
+  Both Kibana nodes producing repeating error every 5 seconds:
+    [ERROR][plugins.monitoring.monitoring] Error: Cluster has no remote_cluster_client role
+
+  Kibana defaults monitoring.ui.ccs.enabled to true, which tries to use
+  Cross-Cluster Search to connect to a dedicated monitoring cluster.
+  No monitoring cluster existed yet, and master nodes don't carry the
+  remote_cluster_client role.
+
+Fix:
+  Added to kibana.yml.j2:
+    monitoring.ui.ccs.enabled: false
+
+  Service restarted to pick up new config.
+
+
+------------------------------------------------------------------------
+ISSUE 08 — cluster_name placeholder overwrote production node config
+------------------------------------------------------------------------
+
+Phase: Rolling reconfiguration of Elasticsearch
+Component: reconfigure-elasticsearch.yml, vars.yml
+
+Error:
+  NDCELSTDN01 fell off the production cluster after the reconfigure playbook
+  ran. Cluster health showed 7 nodes instead of 8. The node was running,
+  service was active, Ansible reported success.
+
+  Root cause: vars.yml contained:
+    cluster_name: "placeholder-update-before-deploy"
+
+  The include_vars task loaded this file, overriding the real cluster name
+  from the production inventory. The rendered elasticsearch.yml had the wrong
+  cluster name. The node started and joined a non-existent cluster.
+
+  Evidence: new log file appeared at:
+    /var/log/elasticsearch/placeholder-update-before-deploy.log
+
+Fix:
+  Manually corrected the cluster name on NDCELSTDN01:
+    sed -i 's/cluster.name: placeholder-update-before-deploy/cluster.name: MOI-ELASTIC-PROD-CLUSTER/' /etc/elasticsearch/elasticsearch.yml
+    systemctl restart elasticsearch
+
+  Updated vars.yml on the automation host with the real cluster name.
+
+  Root cause lesson: include_vars has higher precedence than inventory
+  group_vars in Ansible. Always verify variable precedence when using
+  include_vars alongside inventory variables.
+
+
+------------------------------------------------------------------------
+ISSUE 09 — Bearer auth scheme breaks Ansible URI module against ES 9.x
+------------------------------------------------------------------------
+
+Phase: Rolling reconfiguration
+Component: reconfigure-elasticsearch.yml
+
+Error:
+  Ansible URI module failed with:
+    "AbstractDigestAuthHandler does not support the following scheme: 'Bearer'"
+
+  ES 9.x returns Bearer as the first scheme in WWW-Authenticate on 401:
+    WWW-Authenticate: Bearer realm="security", ApiKey, Basic realm="security"
+
+  Python's urllib picks the first scheme (Bearer) and fails because it has
+  no Bearer auth handler.
+
+Fix:
+  Added force_basic_auth: true to all URI module tasks that authenticate
+  against Elasticsearch. This bypasses scheme negotiation and always uses
+  Basic auth regardless of what the server advertises.
+
+
+------------------------------------------------------------------------
+ISSUE 10 — Elastic Agent 9.x basic flavor missing fleet-server binary
+------------------------------------------------------------------------
+
+Phase: Fleet Server deployment
+Component: install-fleet-server.yml
+
+Error:
+  elastic-agent installed via RPM. Fleet Server component failed with:
+    "input not supported - ensure you have installed the correct flavor"
+    https://www.elastic.co/docs/reference/fleet/install-elastic-agents#elastic-agent-installation-flavors
+
+  Verification:
+    ls /var/lib/elastic-agent/data/elastic-agent-9.3.4-*/components/
+    → fleet-server binary absent
+
+    rpm -ql elastic-agent-9.3.4-x86_64.rpm | grep fleet
+    → fleet-server listed in RPM metadata but not installed to disk
+
+Fix:
+  Elastic Agent 9.x ships in a basic flavor by default. Fleet Server
+  requires the servers flavor. The --install-servers flag must be passed
+  to elastic-agent install (not enroll):
+
+    ./elastic-agent install --install-servers [other flags]
+
+  Additionally: RPM-based installation blocks elastic-agent install with
+  "Installed as a system package, installation will not be altered."
+  Solution: use the tar.gz package, not the RPM, for Fleet Server nodes.
+
+  GitHub issue tracking this: #211899 (opened Feb 2025, closed Mar 2025).
+  The flag was not in the Kibana UI or documentation until the fix shipped.
+
+
+------------------------------------------------------------------------
+ISSUE 11 — Fleet Server policy not found: fleet not initialized in Kibana
+------------------------------------------------------------------------
+
+Phase: Fleet Server deployment
+Component: install-fleet-server.yml
+
+Error:
+  elastic-agent install timed out after 10 minutes with:
+    "fleet-server failed: timed out waiting for Fleet Server to start after 10m0s"
+
+  Logs showed:
+    "Fleet Server - Waiting on policy with Fleet Server integration: fleet-server-policy"
+
+  The fleet-server-policy did not exist because Fleet had never been
+  initialized in Kibana. The --fleet-server-policy flag caused Fleet Server
+  to wait indefinitely for a policy that would never arrive.
+
+Fix:
+  1. Create the Fleet Server policy through Kibana Fleet wizard:
+     Fleet → Settings → Add Fleet Server → Advanced
+     This creates the fleet-server-policy with the Fleet Server integration
+     already attached.
+
+  2. The generic "Create agent policy" path does NOT attach the Fleet Server
+     integration automatically. Must use the dedicated Fleet Server wizard.
+
+  3. POST /api/fleet/setup alone does not create the fleet-server-policy.
+     The wizard is required.
+
+
+------------------------------------------------------------------------
+ISSUE 12 — x509 certificate error during Fleet Server self-enrollment
+------------------------------------------------------------------------
+
+Phase: Fleet Server deployment
+Component: install-fleet-server.yml
+
+Error:
+  elastic-agent install succeeded but enrollment failed repeatedly with:
+    "Error dialing x509: certificate signed by unknown authority"
+    "server.address":"localhost:8221"
+
+  Fleet Server started, then the agent tried to enroll itself back to
+  Fleet Server at localhost:8221. Without a CA cert, it couldn't verify
+  the Fleet Server's TLS certificate.
+
+Fix:
+  Added --certificate-authorities flag to the install command:
+    --certificate-authorities=/etc/kibana/certificates/ca.crt
+
+  This tells the agent to trust the CA that signed Fleet Server's cert.
+
+
+------------------------------------------------------------------------
+ISSUE 13 — Vault lock blocked reinstall after partial failure
+------------------------------------------------------------------------
+
+Phase: Fleet Server deployment
+Component: install-fleet-server.yml
+
+Error:
+  After a failed install attempt left elastic-agent running, a subsequent
+  install attempt failed with:
+    "failed to acquire exclusive lock: /opt/Elastic/Agent/vault/.lock
+     err: context deadline exceeded"
+
+  The running elastic-agent process held the vault lock. The new install
+  could not proceed.
+
+Fix:
+  Fully clean the node before reinstalling:
+    systemctl stop elastic-agent
+    /opt/Elastic/Agent/elastic-agent uninstall --force
+    rm -rf /opt/Elastic/Agent /etc/elastic-agent/elastic-agent.yml
+
+
+------------------------------------------------------------------------
+ISSUE 14 — Fleet per-policy output requires Platinum license
+------------------------------------------------------------------------
+
+Phase: Elastic Agent deployment for monitoring
+Component: install-elastic-agents.yml
+
+Error:
+  Attempting to create an agent policy with a custom output (monitoring
+  cluster) failed with:
+    "Invalid licence to set per policy output, you need platinum licence"
+
+  Fleet managed agents can only route data to a non-default output if
+  the license is Platinum or above. Basic license locks all agents to
+  the default output.
+
+Fix / Decision:
+  Per-policy output routing in Fleet dropped entirely for the monitoring
+  use case. Standalone Elastic Agent (or Metricbeat + Filebeat) will be
+  used to ship production cluster metrics and logs to the monitoring cluster.
+  Standalone deployments have no license restriction on output configuration.
+
+  Fleet is still used for Fleet Server management. Monitoring data collection
+  is handled separately via standalone agents.
+
+
+------------------------------------------------------------------------
+ISSUE 15 — Jinja2 .items resolves to Python dict method, not JSON key
+------------------------------------------------------------------------
+
+Phase: Elastic Agent deployment
+Component: install-elastic-agents.yml
+
+Error:
+  Ansible failed with:
+    "'builtin_function_or_method' object is not iterable"
+
+  When accessing outputs_list.json.items in Jinja2, Python resolved .items
+  to the built-in dict.items() method rather than the JSON key named "items".
+  This happens because Jinja2 attribute access tries Python attributes before
+  dict key lookup.
+
+Fix:
+  Use bracket notation to force dict key lookup:
+    outputs_list.json['items']
+
+  Dot notation (outputs_list.json.items) is ambiguous when the key name
+  matches a Python built-in method. Always use brackets for JSON keys that
+  clash with Python dict methods (items, keys, values, get, etc.).
