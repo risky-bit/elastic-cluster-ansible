@@ -1,0 +1,32 @@
+# -------------------------------- Metricbeat ---------------------------------
+metricbeat.modules:
+
+- module: elasticsearch
+  xpack.enabled: true
+  period: 10s
+  hosts:
+    - "https://{{ bind_ip }}:{{ http_port }}"
+  username: "elastic"
+  password: "{{ elastic_password }}"
+  ssl.certificate_authorities:
+    - /etc/elasticsearch/certificates/ca.crt
+
+# -------------------------------- Output ------------------------------------
+output.elasticsearch:
+  hosts:
+{% for host in groups['monitoring_nodes'] %}
+    - "https://{{ hostvars[host]['bind_ip'] }}:{{ http_port }}"
+{% endfor %}
+  username: "elastic"
+  password: "{{ mon_elastic_password }}"
+  ssl.certificate_authorities:
+    - /etc/elasticsearch/certificates/ca.crt
+
+# -------------------------------- Setup -------------------------------------
+# .monitoring-es-7-* templates and ILM are managed by Elasticsearch itself
+setup.ilm.enabled: false
+setup.template.enabled: false
+
+# -------------------------------- Logging -----------------------------------
+logging.level: warning
+logging.to_files: false

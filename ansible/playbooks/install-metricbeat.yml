@@ -1,0 +1,87 @@
+---
+# Installs Metricbeat on all production ES nodes for Stack Monitoring.
+# Uses the elasticsearch-xpack module — ships cluster_stats (with license),
+# node_stats, index stats directly to .monitoring-es-7-* on monitoring cluster.
+#
+# Prerequisites:
+#   - metricbeat-{{ es_version }}-x86_64.rpm in binaries/
+#   - elastic_password and mon_elastic_password in secrets.yml
+#   - CA cert at /etc/elasticsearch/certificates/ca.crt on each node
+#     (created by install-standalone-agents.yml; if not present, run that
+#     playbook's cert extraction tasks first or add the task here)
+#
+# Run uninstall-standalone-agents.yml before this playbook.
+
+- name: Install and configure Metricbeat on production ES nodes
+  hosts: elastic_master_nodes:elastic_data_nodes
+  become: true
+  gather_facts: false
+  serial: 3
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Load secrets
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/secrets.yml
+
+    # ----------------------------------------------------------
+    # Install
+    # ----------------------------------------------------------
+    - name: Copy Metricbeat RPM to node
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/binaries/metricbeat-{{ es_version }}-x86_64.rpm
+        dest: /tmp/metricbeat-{{ es_version }}-x86_64.rpm
+        mode: '0644'
+
+    - name: Install Metricbeat RPM
+      ansible.builtin.command: rpm -Uvh /tmp/metricbeat-{{ es_version }}-x86_64.rpm
+      args:
+        creates: /usr/share/metricbeat/bin/metricbeat
+
+    # ----------------------------------------------------------
+    # CA cert (idempotent — skips if already extracted)
+    # ----------------------------------------------------------
+    - name: Extract CA certificate as PEM if not present
+      ansible.builtin.command: >
+        openssl pkcs12 -legacy
+        -in /etc/elasticsearch/certificates/elastic-stack-ca.p12
+        -nokeys
+        -out /etc/elasticsearch/certificates/ca.crt
+        -passin pass:
+      args:
+        creates: /etc/elasticsearch/certificates/ca.crt
+
+    # ----------------------------------------------------------
+    # Configuration
+    # ----------------------------------------------------------
+    - name: Render metricbeat.yml
+      ansible.builtin.template:
+        src: /workspace/elastic-ansible/ansible/templates/metricbeat-production.yml.j2
+        dest: /etc/metricbeat/metricbeat.yml
+        owner: root
+        group: metricbeat
+        mode: '0640'
+
+    # ----------------------------------------------------------
+    # Start
+    # ----------------------------------------------------------
+    - name: Enable and start Metricbeat
+      ansible.builtin.systemd:
+        name: metricbeat
+        enabled: true
+        daemon_reload: true
+        state: restarted
+
+    - name: Pause to allow Metricbeat to start
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: Verify Metricbeat is running
+      ansible.builtin.command: systemctl is-active metricbeat
+      register: mb_active
+      failed_when: mb_active.stdout != "active"
+      changed_when: false

@@ -136,7 +136,11 @@
         owner: root
         group: kibana
         mode: '0660'
-      notify: Restart Kibana
+
+    - name: Restart Kibana
+      ansible.builtin.systemd:
+        name: kibana
+        state: restarted
 
     # ----------------------------------------------------------
     # Start
@@ -169,8 +173,3 @@
       delay: 15
       until: kibana_check.status in [200, 401, 403]
 
-  handlers:
-    - name: Restart Kibana
-      ansible.builtin.systemd:
-        name: kibana
-        state: restarted

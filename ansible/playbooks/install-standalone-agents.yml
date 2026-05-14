@@ -1,0 +1,118 @@
+---
+# Deploys standalone Elastic Agents on all production ES nodes.
+# Agents collect ES metrics, cluster stats, and system metrics,
+# shipping everything directly to the monitoring cluster.
+# No Fleet Server involvement — no per-policy output license required.
+#
+# Prerequisites:
+#   - elastic-agent-{{ es_version }}-linux-x86_64.tar.gz in binaries/
+#   - elastic_password and mon_elastic_password in secrets.yml
+#   - CA cert at /etc/elasticsearch/certificates/elastic-stack-ca.p12 on each node
+
+- name: Deploy standalone Elastic Agents on production ES nodes
+  hosts: elastic_master_nodes:elastic_data_nodes
+  become: true
+  gather_facts: false
+  serial: 1
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Load secrets
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/secrets.yml
+
+    # ----------------------------------------------------------
+    # Transfer and extract tar.gz
+    # ----------------------------------------------------------
+    - name: Copy Elastic Agent tar.gz to node
+      ansible.builtin.copy:
+        src: /workspace/elastic-ansible/binaries/elastic-agent-{{ es_version }}-linux-x86_64.tar.gz
+        dest: /tmp/elastic-agent-{{ es_version }}-linux-x86_64.tar.gz
+        mode: '0644'
+
+    - name: Extract Elastic Agent tar.gz
+      ansible.builtin.unarchive:
+        src: /tmp/elastic-agent-{{ es_version }}-linux-x86_64.tar.gz
+        dest: /tmp/
+        remote_src: true
+        creates: /tmp/elastic-agent-{{ es_version }}-linux-x86_64
+
+    # ----------------------------------------------------------
+    # Extract CA cert PEM for monitoring cluster TLS trust
+    # ----------------------------------------------------------
+    - name: Extract CA certificate as PEM
+      ansible.builtin.command: >
+        openssl pkcs12 -legacy
+        -in /etc/elasticsearch/certificates/elastic-stack-ca.p12
+        -nokeys
+        -out /etc/elasticsearch/certificates/ca.crt
+        -passin pass:
+      args:
+        creates: /etc/elasticsearch/certificates/ca.crt
+
+    - name: Set CA certificate permissions
+      ansible.builtin.file:
+        path: /etc/elasticsearch/certificates/ca.crt
+        owner: root
+        group: elasticsearch
+        mode: '0640'
+
+    # ----------------------------------------------------------
+    # Install Elastic Agent (standalone — no Fleet flags)
+    # ----------------------------------------------------------
+    - name: Install Elastic Agent
+      ansible.builtin.command: >
+        ./elastic-agent install --force
+      args:
+        chdir: /tmp/elastic-agent-{{ es_version }}-linux-x86_64
+        creates: /opt/Elastic/Agent/elastic-agent
+      changed_when: true
+
+    # ----------------------------------------------------------
+    # Deploy standalone config
+    # ----------------------------------------------------------
+    - name: Ensure elastic-agent config directory exists
+      ansible.builtin.file:
+        path: /etc/elastic-agent
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Render standalone elastic-agent.yml
+      ansible.builtin.template:
+        src: /workspace/elastic-ansible/ansible/templates/elastic-agent-standalone.yml.j2
+        dest: /opt/Elastic/Agent/elastic-agent.yml
+        owner: root
+        group: root
+        mode: '0600'
+      notify: Restart Elastic Agent
+
+    # ----------------------------------------------------------
+    # Start
+    # ----------------------------------------------------------
+    - name: Enable and start Elastic Agent
+      ansible.builtin.systemd:
+        name: elastic-agent
+        enabled: true
+        daemon_reload: true
+        state: started
+
+    - name: Wait for Elastic Agent to be running
+      ansible.builtin.command: systemctl is-active elastic-agent
+      register: agent_active
+      failed_when: agent_active.stdout != "active"
+      changed_when: false
+      retries: 10
+      delay: 10
+      until: agent_active.stdout == "active"
+
+  handlers:
+    - name: Restart Elastic Agent
+      ansible.builtin.systemd:
+        name: elastic-agent
+        state: restarted

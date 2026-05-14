@@ -1,0 +1,91 @@
+---
+# Removes standalone Elastic Agents from all production ES nodes and cleans
+# up any data they shipped to the monitoring cluster.
+#
+# Run this before install-metricbeat.yml when switching collection method.
+
+# ============================================================
+# Play 1: Remove agent from all production nodes
+# ============================================================
+- name: Uninstall standalone Elastic Agents from production nodes
+  hosts: elastic_master_nodes:elastic_data_nodes
+  become: true
+  gather_facts: false
+  serial: 3
+
+  tasks:
+
+    - name: Stop elastic-agent service
+      ansible.builtin.systemd:
+        name: elastic-agent
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Run elastic-agent uninstall
+      ansible.builtin.command: /opt/Elastic/Agent/elastic-agent uninstall --force
+      failed_when: false
+      changed_when: true
+      args:
+        removes: /opt/Elastic/Agent/elastic-agent
+
+    - name: Remove installation directory (leftover if uninstall command failed)
+      ansible.builtin.file:
+        path: /opt/Elastic/Agent
+        state: absent
+
+    - name: Remove config directory
+      ansible.builtin.file:
+        path: /etc/elastic-agent
+        state: absent
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+
+# ============================================================
+# Play 2: Delete agent data streams from monitoring cluster
+# ============================================================
+- name: Clean up agent data streams on monitoring cluster
+  hosts: monitoring_nodes
+  become: true
+  gather_facts: false
+  run_once: true
+
+  tasks:
+
+    - name: Load global variables
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/vars.yml
+
+    - name: Load secrets
+      ansible.builtin.include_vars:
+        file: /workspace/elastic-ansible/ansible/inventory/group_vars/all/secrets.yml
+
+    - name: Delete stack_monitoring metrics data streams
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ http_port }}/_data_stream/metrics-elasticsearch.stack_monitoring.*"
+        method: DELETE
+        user: elastic
+        password: "{{ mon_elastic_password }}"
+        validate_certs: false
+        status_code: [200, 404]
+
+    - name: Delete system metrics data streams
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ http_port }}/_data_stream/metrics-system.*"
+        method: DELETE
+        user: elastic
+        password: "{{ mon_elastic_password }}"
+        validate_certs: false
+        status_code: [200, 404]
+
+    - name: Delete elasticsearch server log data streams
+      ansible.builtin.uri:
+        url: "https://{{ bind_ip }}:{{ http_port }}/_data_stream/logs-elasticsearch.*"
+        method: DELETE
+        user: elastic
+        password: "{{ mon_elastic_password }}"
+        validate_certs: false
+        status_code: [200, 404]

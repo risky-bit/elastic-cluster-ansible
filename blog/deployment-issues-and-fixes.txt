@@ -380,3 +380,338 @@ Fix:
   Dot notation (outputs_list.json.items) is ambiguous when the key name
   matches a Python built-in method. Always use brackets for JSON keys that
   clash with Python dict methods (items, keys, values, get, etc.).
+
+
+------------------------------------------------------------------------
+ISSUE 16 — Fleet EPM package install fails silently in air-gapped env
+------------------------------------------------------------------------
+
+Phase: Elastic Agent standalone deployment
+Component: Kibana Fleet → Integrations
+
+Error:
+  Attempted to install the Elasticsearch integration package via the
+  Kibana Fleet EPM API to create index templates and ILM policies for
+  metrics-elasticsearch.* and metrics-system.* data streams:
+
+    POST /api/fleet/epm/packages/elasticsearch/latest
+    → "error": "Internal Server Error"
+
+  The Kibana Integrations UI showed "Elasticsearch Logs" and
+  "Elasticsearch Metrics" as Beats-only integrations. No Elastic Agent
+  version of the Elasticsearch monitoring integration was visible.
+
+  The index_template check confirmed templates did not exist:
+    GET /_index_template/metrics-elasticsearch* → empty
+    GET /_index_template/metrics-system*        → empty
+
+Root cause:
+  The monitoring host is air-gapped. Kibana's Fleet EPM integration
+  installer fetches packages from packages.elastic.co at install time.
+  No internet = Internal Server Error with no useful detail.
+
+Fix / Decision:
+  Integration package installation abandoned. Elasticsearch ships built-in
+  base templates for metrics-*-* and logs-*-* patterns, and a built-in
+  "metrics" ILM policy. These are sufficient for standalone agents writing
+  to correctly-named data streams (e.g. metrics-elasticsearch.node_stats-default).
+
+  Integration-specific templates (from the package) add tighter field
+  mappings but are not required for data to be stored and queried correctly.
+
+  Verification step deferred to next session:
+    GET /_index_template/metrics         → confirm base template exists
+    GET /_ilm/policy/metrics             → confirm built-in ILM exists
+  If both present, re-run install-standalone-agents.yml to push updated
+  config with proper data_stream.dataset fields.
+
+  UPDATE (2026-05-14): EPM binary upload WAS achieved (see Issue 17) but the
+  approach was ultimately abandoned. Switched to Metricbeat which needs no
+  EPM packages — it ships to .monitoring-es-7-* using built-in ES templates.
+
+
+------------------------------------------------------------------------
+ISSUE 17 — EPR package download URL: redirect silently returns 69-byte HTML
+------------------------------------------------------------------------
+
+Phase: Elastic Agent standalone deployment
+Component: Kibana Fleet EPM binary upload workaround
+
+Error:
+  Attempted air-gapped EPM package install by downloading from the Elastic
+  Package Registry and uploading to Kibana. Download URL used:
+    https://epr.elastic.co/package/elasticsearch/1.21.1.zip
+
+  Downloaded file was 69 bytes. curl -I showed HTTP 301 Moved Permanently.
+  Kibana rejected the upload with:
+    "statusCode": 400, "error": "Bad Request", "message": "zip file truncated"
+
+Root cause:
+  The correct EPR download URL format is:
+    https://epr.elastic.co/epr/{package}/{package}-{version}.zip
+
+  The /package/ path redirects. The /epr/ path serves the actual zip.
+
+Fix:
+  Correct URL format:
+    https://epr.elastic.co/epr/elasticsearch/elasticsearch-1.21.1.zip
+    https://epr.elastic.co/epr/system/system-2.17.0.zip
+
+  To find the current version for a package:
+    curl -s "https://epr.elastic.co/search?package=elasticsearch&kibana.version=9.3.4"
+
+  Upload to Kibana:
+    curl -sk -u elastic:<password> \
+      -X POST https://<kibana>:5601/api/fleet/epm/packages \
+      -H "kbn-xsrf: true" \
+      -H "Content-Type: application/zip" \
+      --data-binary @elasticsearch-1.21.1.zip
+
+
+------------------------------------------------------------------------
+ISSUE 18 — Kibana 9.x FATAL crash: monitoring.ui.elasticsearch.username elastic forbidden
+------------------------------------------------------------------------
+
+Phase: Monitoring Kibana configuration
+Component: ansible/templates/kibana-monitoring.yml.j2
+
+Error:
+  Kibana crashed on startup with:
+    FATAL  Error: [config validation of [monitoring].ui.elasticsearch.username]:
+    value of 'elastic' is forbidden. This is a superuser account.
+
+  kibana.yml contained:
+    monitoring.ui.elasticsearch.username: "elastic"
+    monitoring.ui.elasticsearch.password: "..."
+
+  These settings were added to allow Stack Monitoring to connect to the
+  production cluster and fetch license information.
+
+Root cause:
+  Kibana 9.x explicitly forbids using the elastic superuser for
+  monitoring.ui.elasticsearch.* settings. Any value of 'elastic' causes
+  a startup FATAL — Kibana will not start at all, not even partially.
+
+Fix:
+  Removed all monitoring.ui.elasticsearch.* settings from kibana.yml
+  entirely. In the new ECS-based monitoring model (Elastic Agent / Metricbeat
+  shipping to data streams), Kibana reads monitoring data from the stored
+  indices and does not need a live connection to the monitored cluster.
+
+  If a live connection is needed in future, a dedicated monitoring user
+  with appropriate privileges (not elastic) must be used.
+
+
+------------------------------------------------------------------------
+ISSUE 19 — Monitoring Kibana: second node not restarting after playbook
+------------------------------------------------------------------------
+
+Phase: Monitoring Kibana deployment
+Component: ansible/playbooks/install-monitoring-kibana.yml
+
+Error:
+  After running the install-monitoring-kibana.yml playbook, MON01 restarted
+  correctly with the new kibana.yml. MON02 kept running the old config.
+  Stack Monitoring showed split behaviour between the two nodes.
+
+  The playbook used:
+    - name: Render kibana.yml
+      notify: Restart Kibana
+
+  handlers:
+    - name: Restart Kibana
+      systemd: name=kibana state=restarted
+
+Root cause:
+  Ansible handlers only fire when the notifying task reports "changed".
+  The kibana_system password is reset at the start of every playbook run
+  (elasticsearch-reset-password generates a new random value). MON01
+  always gets a new password → new config content → template task reports
+  changed → handler fires.
+
+  MON02 runs after MON01 (serial: 1). By the time MON02 renders its
+  kibana.yml, Ansible's template module compares the rendered content with
+  the file on disk. If the rendered content is identical to what MON01
+  already wrote (same password was propagated), the task reports "ok" not
+  "changed" → handler does not fire → old config stays loaded in memory.
+
+Fix:
+  Replaced the handler with a direct restart task immediately after the
+  template task. A direct systemd restart task always runs regardless of
+  whether the template changed:
+
+    - name: Render kibana.yml
+      ansible.builtin.template: ...
+
+    - name: Restart Kibana
+      ansible.builtin.systemd:
+        name: kibana
+        state: restarted
+
+  Removed the handlers section entirely.
+
+
+------------------------------------------------------------------------
+ISSUE 20 — Stack Monitoring API disabled by default in Kibana 9.x
+------------------------------------------------------------------------
+
+Phase: Monitoring Kibana configuration
+Component: ansible/templates/kibana-monitoring.yml.j2
+
+Error:
+  Stack Monitoring page returned:
+    "This API is not available with the current configuration."
+    HTTP 503
+
+  Kibana logs showed no errors. Service was running and healthy.
+
+Root cause:
+  In Kibana 9.x, the Stack Monitoring UI is disabled by default. The API
+  endpoint at /api/monitoring/v1/clusters returns 503 unless explicitly
+  enabled in config.
+
+Fix:
+  Added to kibana-monitoring.yml.j2:
+    monitoring.ui.enabled: true
+
+  Restart required to pick up the change.
+
+
+------------------------------------------------------------------------
+ISSUE 21 — Elastic Agent elasticsearch/metrics input missing license in cluster_stats
+------------------------------------------------------------------------
+
+Phase: Standalone Elastic Agent monitoring deployment
+Component: ansible/templates/elastic-agent-standalone.yml.j2
+
+Error:
+  Agents deployed, data landing in metrics-elasticsearch.stack_monitoring.*
+  data streams. Kibana Stack Monitoring found the production cluster by name
+  (MOI-ELASTIC-PROD-CLUSTER) but threw:
+    "Could not find license information for cluster = 'MOI-ELASTIC-PROD-CLUSTER'"
+    MonitoringLicenseError at get_clusters_summary.js:44
+
+  The cluster_stats documents in the data stream had no license field.
+
+Root cause:
+  The Elastic Agent elasticsearch integration's cluster_stats metricset calls
+  /_cluster/stats. This API endpoint does not return license information.
+  License data requires a separate call to /_license.
+
+  The Elastic Agent integration does NOT make this second call and does NOT
+  embed license info in cluster_stats documents. Stack Monitoring requires
+  the license field to render the cluster summary — without it, the entire
+  cluster list API throws and no clusters show (not even the monitoring
+  cluster itself).
+
+Fix / Decision:
+  Switched to Metricbeat with the elasticsearch-xpack module. Metricbeat's
+  cluster_stats metricset calls both /_cluster/stats AND /_license and merges
+  them into a single document. Stack Monitoring can find the license and render
+  the cluster correctly.
+
+  Standalone Elastic Agent is not suitable for Stack Monitoring collection
+  when running in standalone mode on Elastic 9.x — at minimum not with the
+  elasticsearch/metrics input type.
+
+
+------------------------------------------------------------------------
+ISSUE 22 — MonitoringLicenseError for one cluster crashes entire Stack Monitoring page
+------------------------------------------------------------------------
+
+Phase: Standalone Elastic Agent monitoring deployment
+Component: Kibana Stack Monitoring UI
+
+Error:
+  Stack Monitoring showed "No monitoring data found" for ALL clusters,
+  including the monitoring cluster itself (which had valid .monitoring-es-7-*
+  data collected by Kibana's own collection).
+
+Root cause:
+  Stack Monitoring's getClustersFromRequest calls getClustersSummary which
+  uses Array.map over all discovered clusters. When any cluster throws
+  MonitoringLicenseError (license field missing), the exception propagates
+  out of the map and the entire API call fails with 503. No clusters are
+  returned — not even ones with valid data.
+
+  This means a single broken cluster (production, in our case) silently
+  hides all other clusters in the monitoring UI.
+
+Fix:
+  Deleted the production cluster's data streams (metrics-elasticsearch.*,
+  metrics-system.*, logs-elasticsearch.*). With no data for the production
+  cluster, Stack Monitoring no longer discovers it, no exception is thrown,
+  and the monitoring cluster renders correctly.
+
+  Permanent fix: Metricbeat (Issue 21) — data includes license, no error.
+
+
+------------------------------------------------------------------------
+ISSUE 23 — lineinfile without regexp appends duplicate lines on every run
+------------------------------------------------------------------------
+
+Phase: Monitoring cluster bootstrap
+Component: install-monitoring-elasticsearch.yml
+
+Error:
+  /root/mon-credentials.txt accumulated 4 separate kibana_system password
+  entries after the playbook ran multiple times:
+    kibana_system: <old-password-1>
+    kibana_system: <old-password-2>
+    kibana_system: <old-password-3>
+    kibana_system: <current-password>
+
+  The playbook used:
+    ansible.builtin.lineinfile:
+      path: /root/mon-credentials.txt
+      line: "kibana_system: {{ mon_kibana_system_password }}"
+
+Root cause:
+  lineinfile without a regexp: parameter checks for exact line content.
+  Because the kibana_system password changes every run (reset by
+  elasticsearch-reset-password), the new line never matches the old one.
+  lineinfile appends a new line every time instead of replacing.
+
+Fix:
+  Add a regexp to match the key regardless of value:
+    regexp: "^kibana_system:"
+    line: "kibana_system: {{ mon_kibana_system_password }}"
+
+  This replaces the existing entry instead of appending.
+  The bottom entry in the file is always current if regexp is missing —
+  useful for forensics but messy for automation.
+
+
+------------------------------------------------------------------------
+ISSUE 24 — Ansible worker dies when vars: lookup() used inside task block
+------------------------------------------------------------------------
+
+Phase: Standalone agent cleanup
+Component: ansible/playbooks/uninstall-standalone-agents.yml
+
+Error:
+  Playbook failed mid-run with:
+    "A worker was found in a dead state"
+    "Failed to run task: exit status 1"
+
+  The failing task was:
+    - name: Remove extracted tar.gz
+      ansible.builtin.file:
+        path: /tmp/elastic-agent-{{ es_version }}-linux-x86_64
+        state: absent
+      vars:
+        es_version: "{{ lookup('vars', 'es_version', default='') }}"
+      failed_when: false
+
+Root cause:
+  Using vars: with a lookup() expression inside a task block is non-standard
+  Ansible. The Play 1 host had no include_vars loading es_version, so the
+  template evaluation failed during worker serialisation. The worker process
+  died rather than returning a clean failure — failed_when: false did not
+  help because the crash happened before task execution.
+
+Fix:
+  Removed the task entirely. The /tmp directory is cleaned by the OS and
+  the leftover tar.gz has no operational impact. If cleanup is needed,
+  add include_vars to the play first so es_version resolves correctly,
+  then use a straightforward file: state=absent without a vars: block.
